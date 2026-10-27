@@ -28,6 +28,7 @@ PAYOUT_WALLET = os.getenv("PAYOUT_WALLET", "0x2695a6D9CB6AFf1b042F2dA4485f37427f
 HISTORY_START = os.getenv("HISTORY_START", "2026-06-25")  # wallet was funded ~late June 2026
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "60"))
 MIN_PAYOUT_USD = float(os.getenv("MIN_PAYOUT_USD", "1"))
+BIG_PAYOUT_USD = float(os.getenv("BIG_PAYOUT_USD", "2500"))  # gold card + 🔥 at or above this
 SKIP_ADDRESSES = {a.strip().lower() for a in os.getenv("SKIP_ADDRESSES", "").split(",") if a.strip()}
 
 RANGE_LIMIT_RE = re.compile(r"less than (\d+)")
@@ -36,6 +37,7 @@ CHAINS = {
     "bsc": {
         "rpc": "https://bsc-mainnet.nodereal.io/v1/{key}",
         "explorer": "https://bscscan.com/tx/",
+        "name": "BNB Chain",
         "native": None,  # BNB sends are gas top-ups, not payouts
         "tokens": {"0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d": "USDC"},
         "range": 50_000,  # blocks per lookup (auto-shrinks if NodeReal says it's too big)
@@ -44,6 +46,7 @@ CHAINS = {
     "eth": {
         "rpc": "https://eth-mainnet.nodereal.io/v1/{key}",
         "explorer": "https://etherscan.io/tx/",
+        "name": "Ethereum",
         "native": "ETH",
         "tokens": {"0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48": "USDC"},
         "range": 999,     # NodeReal limit on Ethereum: under 1000 blocks
@@ -229,7 +232,8 @@ class PayoutFeed:
         return None
 
     # --------------------------------------------------------------- posting
-    async def format_line(self, p: dict) -> str | None:
+    async def build_card(self, p: dict) -> discord.Embed | None:
+        """One payout as a clean card. The title is the amount and links to the transaction."""
         usd = await self.usd_value(p)
         if usd is not None:
             if usd < MIN_PAYOUT_USD:
@@ -237,27 +241,36 @@ class PayoutFeed:
             amount = f"${usd:,.2f}"
         else:
             amount = f"{p['amount']:,.4f} {p['asset']}"
-        link = CHAINS[p["chain"]]["explorer"] + p["hash"]
-        return f"✅ Payout sent! **Trader** has just received **{amount}**. Congratulations! [🔗](<{link}>)"
+        big = usd is not None and usd >= BIG_PAYOUT_USD
+        network = f"{p['asset']} · {CHAINS[p['chain']]['name']}"
+        embed = discord.Embed(
+            title=f"{'🔥' if big else '💸'}  {amount} paid out",
+            url=CHAINS[p["chain"]]["explorer"] + p["hash"],
+            description=f"A **Trader** just got paid. Congratulations! 🎉\n-# {network}",
+            colour=0xF1C40F if big else 0x2ECC71,
+            timestamp=datetime.fromtimestamp(p["ts"], tz=timezone.utc),
+        )
+        embed.set_footer(text="Verified on-chain · tap the amount to view")
+        return embed
 
     async def post(self, payouts: list[dict]):
         channel = self.client.get_channel(FEED_CHANNEL_ID) or await self.client.fetch_channel(FEED_CHANNEL_ID)
         payouts.sort(key=lambda p: (p["ts"], p["block"]))
-        buf = ""
+        batch: list[discord.Embed] = []
         for p in payouts:
             if p["hash"] in self.seen:
                 continue
-            line = await self.format_line(p)
+            card = await self.build_card(p)
             self.seen.add(p["hash"])
-            if not line:
+            if not card:
                 continue
-            if len(buf) + len(line) + 1 > 1900:
-                await channel.send(buf, allowed_mentions=discord.AllowedMentions.none())
+            batch.append(card)
+            if len(batch) == 10:  # Discord allows 10 cards per message
+                await channel.send(embeds=batch)
                 await asyncio.sleep(1)
-                buf = ""
-            buf += line + "\n"
-        if buf:
-            await channel.send(buf, allowed_mentions=discord.AllowedMentions.none())
+                batch = []
+        if batch:
+            await channel.send(embeds=batch)
 
     # ------------------------------------------------------------- lifecycle
     async def load_state(self) -> datetime | None:
@@ -267,7 +280,8 @@ class PayoutFeed:
         async for msg in channel.history(limit=1000):
             if msg.author.id != self.client.user.id:
                 continue
-            hashes = [h.lower() for _, h in TX_LINK_RE.findall(msg.content)]
+            text = msg.content + " " + " ".join(f"{e.url or ''} {e.description or ''}" for e in msg.embeds)
+            hashes = [h.lower() for _, h in TX_LINK_RE.findall(text)]
             if hashes:
                 self.seen.update(hashes)
                 last_post = last_post or msg.created_at
