@@ -144,6 +144,7 @@ Rules:
 - Only use information actually present in the ticket or screenshots. Never guess. If a field is missing, use exactly "Not provided".
 - crypto_wallet: the user's own receiving address, copied character for character. If the user corrected it, use the latest one they confirmed.
 - cashed_username: the user's CASHED account username (not their Discord name unless they say it's the same).
+- cashed_email: the email address on the user's CASHED account, exactly as written.
 - crypto_network: the chain and coin written naturally, e.g. "Solana USDC", "Tron USDT", "Ethereum USDC", "Bitcoin", "Litecoin". Only infer the chain from the address format if it is unambiguous (e.g. bc1... = Bitcoin); otherwise "Not provided".
 - payout_amount_usd: the dollar amount being paid out, formatted like "$25.00". If only a crypto amount is given, write that amount and coin instead.
 - An address starting with 0x is EVM (could be BNB Smart Chain, Ethereum, etc.), so only name the chain if the user said it.
@@ -157,12 +158,14 @@ PAYOUT_TOOL = {
         "type": "object",
         "properties": {
             "cashed_username": {"type": "string"},
+            "cashed_email": {"type": "string"},
             "crypto_wallet": {"type": "string"},
             "crypto_network": {"type": "string"},
             "payout_amount_usd": {"type": "string"},
             "note": {"type": "string"},
         },
-        "required": ["cashed_username", "crypto_wallet", "crypto_network", "payout_amount_usd", "note"],
+        "required": ["cashed_username", "cashed_email", "crypto_wallet", "crypto_network",
+                     "payout_amount_usd", "note"],
     },
 }
 
@@ -366,14 +369,15 @@ async def payout(interaction: discord.Interaction):
         v = (data.get(key) or "Not provided").strip().replace("`", "")
         return v
 
-    username = val("cashed_username")
+    username, email = val("cashed_username"), val("cashed_email")
     wallet, network, amount = val("crypto_wallet"), val("crypto_network"), val("payout_amount_usd")
 
     # One line, ready to paste. <#id> turns into a clickable channel link when pasted in Discord.
-    who = f" ({username})" if username != "Not provided" else ""
+    who_parts = [v for v in (username, email) if v != "Not provided"]
+    who = f" ({' · '.join(who_parts)})" if who_parts else ""
     line = f"<#{channel.id}>{who} · {amount} · {network} · `{wallet}`"
 
-    missing = [n for n, v in (("username", username), ("amount", amount),
+    missing = [n for n, v in (("username", username), ("email", email), ("amount", amount),
                               ("network", network), ("address", wallet)) if v == "Not provided"]
 
     embed = discord.Embed(title="💸 Payout", description=line, colour=0x2ECC71)
