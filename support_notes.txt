@@ -1,0 +1,16 @@
+# CASHED support notes
+# The bot follows these when suggesting how to solve a ticket and what to reply.
+# Edit freely: plain sentences are fine. Add your real rules, timelines and links.
+
+Ticket types:
+- General support: account issues, bugs, questions, anything else.
+- Partnership: collabs, affiliates, events, AMAs.
+- Payout: payout delays, pending withdrawals, payout questions.
+
+Payout rules:
+- Users should only open a payout ticket once their payout request has been pending for 24 hours. If it has been less than 24 hours, politely ask them to wait until it has been 24 hours.
+- To look into a payout we need: CASHED username, CASHED email, payout amount ($), and the crypto wallet address (plus coin/network).
+- Never confirm a payout has been sent unless staff have confirmed it in the ticket.
+
+General:
+- One ticket per issue. Ask users to be specific and send screenshots if they have them.
