@@ -26,6 +26,7 @@ STAFF_ROLE_IDS = {int(x) for x in os.getenv("STAFF_ROLE_IDS", "").split(",") if 
 MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-5-5")
 MAX_MESSAGES = int(os.getenv("MAX_MESSAGES", "300"))
 MAX_IMAGES = int(os.getenv("MAX_IMAGES", "5"))
+PAYOUT_CHANNEL_ID = int(os.getenv("PAYOUT_CHANNEL_ID", "0") or 0)  # /payout auto-posts its line here
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("ticket-bot")
@@ -388,6 +389,27 @@ async def payout(interaction: discord.Interaction):
     if note:
         embed.add_field(name="⚠️ Check", value=note[:1024], inline=False)
     embed.set_footer(text="AI-extracted: check the address against the user's message before sending.")
+
+    # Auto-post the line into the payout channel (if one is set)
+    posted_to = None
+    if PAYOUT_CHANNEL_ID:
+        if wallet == "Not provided" or amount == "Not provided":
+            embed.add_field(name="Not posted",
+                            value="Missing the address or amount, so nothing was sent to the payout channel.",
+                            inline=False)
+        else:
+            try:
+                target = bot.get_channel(PAYOUT_CHANNEL_ID) or await bot.fetch_channel(PAYOUT_CHANNEL_ID)
+                text = line + (f"\n-# ⚠️ {note}" if note else "") + f"\n-# Added by {interaction.user.mention}"
+                await target.send(text[:2000], allowed_mentions=discord.AllowedMentions.none())
+                posted_to = target
+            except Exception as e:
+                log.exception("Couldn't post to payout channel")
+                embed.add_field(name="Not posted", value=f"Couldn't post to the payout channel: {e}"[:1024],
+                                inline=False)
+
+    if posted_to:
+        embed.title = f"✅ Sent to #{posted_to.name}"
     await interaction.followup.send(embed=embed, view=ReplyView(line, label="Copy line"), ephemeral=True)
 
 
