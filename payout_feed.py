@@ -244,13 +244,13 @@ class PayoutFeed:
         big = usd is not None and usd >= BIG_PAYOUT_USD
         network = f"{p['asset']} · {CHAINS[p['chain']]['name']}"
         embed = discord.Embed(
-            title=f"{'🔥' if big else '💸'}  {amount} paid out",
+            title=f"{'🔥' if big else '💸'}  {amount} Payout",
             url=CHAINS[p["chain"]]["explorer"] + p["hash"],
-            description=f"A **Trader** just got paid. Congratulations! 🎉\n-# {network}",
+            description="A **Trader** just got paid 🎉",
             colour=0xF1C40F if big else 0x2ECC71,
             timestamp=datetime.fromtimestamp(p["ts"], tz=timezone.utc),
         )
-        embed.set_footer(text="Verified on-chain · tap the amount to view")
+        embed.set_footer(text=network)
         return embed
 
     async def post(self, payouts: list[dict]):
