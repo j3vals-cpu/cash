@@ -28,10 +28,25 @@ PAYOUT_WALLET = os.getenv("PAYOUT_WALLET", "0x2695a6D9CB6AFf1b042F2dA4485f37427f
 HISTORY_START = os.getenv("HISTORY_START", "2026-06-25")  # wallet was funded ~late June 2026
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "60"))
 MIN_PAYOUT_USD = float(os.getenv("MIN_PAYOUT_USD", "1"))
-BIG_PAYOUT_USD = float(os.getenv("BIG_PAYOUT_USD", "2500"))  # gold card + 🔥 at or above this
 SKIP_ADDRESSES = {a.strip().lower() for a in os.getenv("SKIP_ADDRESSES", "").split(",") if a.strip()}
 
 RANGE_LIMIT_RE = re.compile(r"less than (\d+)")
+
+# Card colour + label by amount (highest first)
+TIERS = [
+    (10_000, 0xF5B700, "RECORD PAYOUT"),
+    (5_000,  0xA855F7, "MAJOR PAYOUT"),
+    (1_000,  0x3B82F6, "BIG PAYOUT"),
+    (0,      0x22C55E, "PAYOUT SENT"),
+]
+DIVIDER = "━" * 30  # makes every card the same, wider width
+
+
+def tier_for(usd):
+    for minimum, colour, label in TIERS:
+        if (usd or 0) >= minimum:
+            return colour, label
+    return TIERS[-1][1], TIERS[-1][2]
 
 CHAINS = {
     "bsc": {
@@ -233,7 +248,7 @@ class PayoutFeed:
 
     # --------------------------------------------------------------- posting
     async def build_card(self, p: dict) -> discord.Embed | None:
-        """One payout as a clean card. The title is the amount and links to the transaction."""
+        """One payout as a wide, clean text card. Colour and label depend on the amount."""
         usd = await self.usd_value(p)
         if usd is not None:
             if usd < MIN_PAYOUT_USD:
@@ -241,16 +256,24 @@ class PayoutFeed:
             amount = f"${usd:,.2f}"
         else:
             amount = f"{p['amount']:,.4f} {p['asset']}"
-        big = usd is not None and usd >= BIG_PAYOUT_USD
-        network = f"{p['asset']} · {CHAINS[p['chain']]['name']}"
+        cfg = CHAINS[p["chain"]]
+        link = cfg["explorer"] + p["hash"]
+        short = f"{p['hash'][:6]}…{p['hash'][-4:]}"
+        colour, label = tier_for(usd)
+
         embed = discord.Embed(
-            title=f"{'🔥' if big else '💸'}  {amount} Payout",
-            url=CHAINS[p["chain"]]["explorer"] + p["hash"],
-            description="A **Trader** just got paid 🎉",
-            colour=0xF1C40F if big else 0x2ECC71,
+            description=(f"# {amount}\n"
+                         f"Another trader just got **Cashed Up!**\n"
+                         f"{DIVIDER}"),
+            colour=colour,
             timestamp=datetime.fromtimestamp(p["ts"], tz=timezone.utc),
         )
-        embed.set_footer(text=network)
+        avatar = self.client.user.display_avatar.url if self.client.user else None
+        embed.set_author(name=label, icon_url=avatar)
+        embed.add_field(name="Asset", value=f"`{p['asset']}`", inline=True)
+        embed.add_field(name="Network", value=f"`{cfg['name']}`", inline=True)
+        embed.add_field(name="Transaction", value=f"[{short}]({link})", inline=True)
+        embed.set_footer(text="Cashed  ·  Verified on-chain")
         return embed
 
     async def post(self, payouts: list[dict]):
@@ -280,7 +303,9 @@ class PayoutFeed:
         async for msg in channel.history(limit=1000):
             if msg.author.id != self.client.user.id:
                 continue
-            text = msg.content + " " + " ".join(f"{e.url or ''} {e.description or ''}" for e in msg.embeds)
+            text = msg.content + " " + " ".join(
+                f"{e.url or ''} {e.description or ''} " + " ".join(f.value or "" for f in e.fields)
+                for e in msg.embeds)
             hashes = [h.lower() for _, h in TX_LINK_RE.findall(text)]
             if hashes:
                 self.seen.update(hashes)
