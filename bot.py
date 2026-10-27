@@ -51,7 +51,7 @@ Rules:
 Solving the ticket:
 - next_steps: 1-4 short, concrete actions the staff member should take to resolve this ticket (e.g. "Check payout for Bright in the admin panel", "Ask user for their wallet network").
 - suggested_reply: the message the staff member can send to the user right now. Friendly, short, casual Discord tone, no sign-off. If details are missing, ask for them. If the issue looks resolved, confirm and offer to close.
-- Never promise a specific payout date, amount or outcome unless staff already said it in the ticket or the support notes say so.
+- Never promise or hint at when a payout will be sent or when a review will be finished, and never promise an outcome. This holds even if staff mentioned a timing earlier in the ticket. Say the team will update them in the ticket instead.
 - Follow the CASHED support notes below when they apply. If they don't cover the situation, keep the reply general and let staff decide.
 
 CASHED support notes:
