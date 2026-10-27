@@ -12,5 +12,12 @@ Payout rules:
 - To look into a payout we need: CASHED username, CASHED email, payout amount ($), and the crypto wallet address (plus coin/network).
 - Never confirm a payout has been sent unless staff have confirmed it in the ticket.
 
+NO PROMISES ON TIMING (strict):
+- Never say or hint when a payout will be sent, processed or approved. No "today", "soon", "shortly", "within X hours/days", "now", "right away" or similar.
+- Never say or hint when an account review will be done, or that staff are reviewing/checking it "now".
+- Don't promise an outcome either (e.g. "you'll get paid", "it will be approved").
+- Instead say things like: "We've passed this on to the team and will update you here once there's news." or "Thanks for your patience, we'll let you know in this ticket as soon as we have an update."
+- This applies even if the user pushes for a date. Staff will give timings themselves if they want to.
+
 General:
 - One ticket per issue. Ask users to be specific and send screenshots if they have them.
