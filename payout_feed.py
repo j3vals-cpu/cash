@@ -30,7 +30,7 @@ POLL_SECONDS = int(os.getenv("POLL_SECONDS", "60"))
 MIN_PAYOUT_USD = float(os.getenv("MIN_PAYOUT_USD", "1"))
 SKIP_ADDRESSES = {a.strip().lower() for a in os.getenv("SKIP_ADDRESSES", "").split(",") if a.strip()}
 
-MAX_RANGE = 100_000  # NodeReal block-range limit per request
+RANGE_LIMIT_RE = re.compile(r"less than (\d+)")
 
 CHAINS = {
     "bsc": {
@@ -38,12 +38,16 @@ CHAINS = {
         "explorer": "https://bscscan.com/tx/",
         "native": None,  # BNB sends are gas top-ups, not payouts
         "tokens": {"0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d": "USDC"},
+        "range": 50_000,  # blocks per lookup (auto-shrinks if NodeReal says it's too big)
+        "lag": 60,        # stay this many blocks behind the newest so NodeReal has indexed them
     },
     "eth": {
         "rpc": "https://eth-mainnet.nodereal.io/v1/{key}",
         "explorer": "https://etherscan.io/tx/",
         "native": "ETH",
         "tokens": {"0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48": "USDC"},
+        "range": 999,     # NodeReal limit on Ethereum: under 1000 blocks
+        "lag": 5,
     },
 }
 STABLES = {"USDC", "USDT", "BSC-USD"}
@@ -75,18 +79,27 @@ class PayoutFeed:
     async def rpc(self, chain: str, method: str, params: list):
         url = CHAINS[chain]["rpc"].format(key=NODEREAL_API_KEY)
         payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
-        for attempt in range(4):
+        for attempt in range(6):
             try:
                 async with self.session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=30)) as r:
+                    if r.status == 429:  # rate limited: slow down and retry
+                        await asyncio.sleep(1 + attempt)
+                        continue
                     data = await r.json(content_type=None)
-                if "error" in data:
-                    raise RuntimeError(f"{chain} {method}: {data['error']}")
+                err = data.get("error")
+                if err:
+                    msg = str(err.get("message", err)) if isinstance(err, dict) else str(err)
+                    if "limit" in msg.lower() and "range" not in msg.lower() and attempt < 5:
+                        await asyncio.sleep(1 + attempt)  # rate/compute limit
+                        continue
+                    raise RuntimeError(f"{chain} {method}: {err}")
                 return data["result"]
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                if attempt == 3:
+                if attempt == 5:
                     raise
                 log.warning("RPC %s %s failed (%s), retrying", chain, method, e)
                 await asyncio.sleep(2 * (attempt + 1))
+        raise RuntimeError(f"{chain} {method}: still rate limited after retries")
 
     async def latest_block(self, chain: str) -> int:
         return _int(await self.rpc(chain, "eth_blockNumber", []))
@@ -114,7 +127,7 @@ class PayoutFeed:
         out = []
         b = start
         while b <= end:
-            to = min(b + MAX_RANGE - 1, end)
+            to = min(b + cfg["range"] - 1, end)
             categories = ["20"] + (["external"] if cfg["native"] else [])
             params = {
                 "category": categories,
@@ -124,21 +137,39 @@ class PayoutFeed:
                 "order": "asc",
                 "maxCount": hex(1000),
             }
-            page_key = None
-            while True:
-                if page_key:
-                    params["pageKey"] = page_key
-                res = await self.rpc(chain, "nr_getAssetTransfers", [params])
-                for t in res.get("transfers") or []:
-                    item = self._parse(chain, t)
-                    if item:
-                        out.append(item)
-                page_key = res.get("pageKey")
-                if not page_key:
-                    break
-            params.pop("pageKey", None)
+            chunk = []
+            try:
+                page_key = None
+                while True:
+                    if page_key:
+                        params["pageKey"] = page_key
+                    res = await self.rpc(chain, "nr_getAssetTransfers", [params])
+                    for t in res.get("transfers") or []:
+                        item = self._parse(chain, t)
+                        if item:
+                            chunk.append(item)
+                    page_key = res.get("pageKey")
+                    if not page_key:
+                        break
+            except RuntimeError as e:
+                m = RANGE_LIMIT_RE.search(str(e))
+                if m and "range" in str(e):
+                    new_range = max(1, int(m.group(1)) - 1)
+                    if new_range < cfg["range"]:
+                        log.warning("%s: block range too big, shrinking %d -> %d", chain, cfg["range"], new_range)
+                        cfg["range"] = new_range
+                        continue  # retry this chunk with the smaller range
+                raise
+            out += chunk
             b = to + 1
         return out
+
+    async def nonce_at(self, chain: str, block: int) -> int | None:
+        """Number of transactions the wallet had sent as of a block (None if the node can't say)."""
+        try:
+            return _int(await self.rpc(chain, "eth_getTransactionCount", [PAYOUT_WALLET, hex(block)]))
+        except Exception:
+            return None
 
     def _parse(self, chain: str, t: dict) -> dict | None:
         cfg = CHAINS[chain]
@@ -249,31 +280,61 @@ class PayoutFeed:
         await self.client.wait_until_ready()
         self.session = aiohttp.ClientSession()
         try:
-            last_post = await self.load_state()
-            if last_post:
-                # Restart: rescan from 1 hour before our last post; seen hashes stop duplicates
-                start_ts = int(last_post.timestamp()) - 3600
-                log.info("Payout feed resuming from %s (%d payouts already posted)", last_post, len(self.seen))
-            else:
-                start_ts = int(datetime.fromisoformat(HISTORY_START).replace(tzinfo=timezone.utc).timestamp())
-                log.info("Payout feed first run: posting history since %s", HISTORY_START)
-
-            for chain in CHAINS:
-                self.cursor[chain] = await self.block_at(chain, start_ts)
-
-            while True:
+            while True:  # keep trying to start; a hiccup here shouldn't kill the feed
                 try:
-                    found = []
+                    last_post = await self.load_state()
+                    if last_post:
+                        # Restart: rescan from 1 hour before our last post; seen hashes stop duplicates
+                        start_ts = int(last_post.timestamp()) - 3600
+                        log.info("Payout feed resuming from %s (%d payouts already posted)",
+                                 last_post, len(self.seen))
+                    else:
+                        start_ts = int(datetime.fromisoformat(HISTORY_START)
+                                       .replace(tzinfo=timezone.utc).timestamp())
+                        log.info("Payout feed first run: posting history since %s (this can take a few minutes)",
+                                 HISTORY_START)
                     for chain in CHAINS:
-                        latest = await self.latest_block(chain)
-                        if latest >= self.cursor[chain]:
-                            found += await self.transfers(chain, self.cursor[chain], latest)
-                            self.cursor[chain] = latest + 1
-                    if found:
-                        log.info("Payout feed: %d new transfer(s)", len(found))
-                        await self.post(found)
+                        self.cursor[chain] = await self.block_at(chain, start_ts)
+                    break
                 except Exception:
-                    log.exception("Payout feed poll failed; will retry")
+                    log.exception("Payout feed couldn't start; retrying in 60s")
+                    await asyncio.sleep(60)
+
+            nonces: dict[str, int | None] = {c: None for c in CHAINS}
+            while True:
+                await self.poll(nonces)
                 await asyncio.sleep(POLL_SECONDS)
         finally:
             await self.session.close()
+
+    async def poll(self, nonces: dict):
+        """One pass over every chain. A chain's cursor only moves forward after its payouts are posted,
+        and a failure on one chain never throws away what another chain found."""
+        results = {}  # chain -> (payouts, scanned_up_to, nonce_there)
+        for chain, cfg in CHAINS.items():
+            try:
+                safe = await self.latest_block(chain) - cfg["lag"]
+                if safe < self.cursor[chain]:
+                    continue
+                # Cheap check: if the wallet's sent-transaction count hasn't changed, nothing went out.
+                nonce = await self.nonce_at(chain, safe)
+                if nonce is not None and nonces[chain] is not None and nonce == nonces[chain]:
+                    results[chain] = ([], safe, nonce)
+                    continue
+                items = await self.transfers(chain, self.cursor[chain], safe)
+                results[chain] = (items, safe, nonce)
+            except Exception:
+                log.exception("Payout feed: %s scan failed; will retry next round", chain)
+
+        found = [p for items, _, _ in results.values() for p in items]
+        if found:
+            log.info("Payout feed: %d transfer(s) found", len(found))
+            try:
+                await self.post(found)
+            except Exception:
+                log.exception("Payout feed: posting to Discord failed; will retry")
+                return  # don't move cursors, so these get retried (already-posted ones are skipped)
+
+        for chain, (_, safe, nonce) in results.items():
+            self.cursor[chain] = safe + 1
+            nonces[chain] = nonce
