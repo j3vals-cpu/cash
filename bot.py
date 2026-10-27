@@ -27,6 +27,20 @@ MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-5-5")
 MAX_MESSAGES = int(os.getenv("MAX_MESSAGES", "300"))
 MAX_IMAGES = int(os.getenv("MAX_IMAGES", "5"))
 PAYOUT_CHANNEL_ID = int(os.getenv("PAYOUT_CHANNEL_ID", "0") or 0)  # /payout auto-posts its line here
+LARGE_PAYOUT_CHANNEL_ID = int(os.getenv("LARGE_PAYOUT_CHANNEL_ID", "0") or 0)  # ...or here if it's large
+LARGE_PAYOUT_THRESHOLD = float(os.getenv("LARGE_PAYOUT_THRESHOLD", "1500"))
+
+
+def usd_amount(text: str) -> float | None:
+    """'$1,505.00' -> 1505.0. None if it isn't a dollar amount."""
+    import re as _re
+    m = _re.search(r"\$\s*([\d,]+(?:\.\d+)?)", text or "")
+    if not m:
+        return None
+    try:
+        return float(m.group(1).replace(",", ""))
+    except ValueError:
+        return None
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("ticket-bot")
@@ -399,7 +413,12 @@ async def payout(interaction: discord.Interaction):
                             inline=False)
         else:
             try:
-                target = bot.get_channel(PAYOUT_CHANNEL_ID) or await bot.fetch_channel(PAYOUT_CHANNEL_ID)
+                # Large payouts go to their own channel (if set)
+                usd = usd_amount(amount)
+                target_id = PAYOUT_CHANNEL_ID
+                if LARGE_PAYOUT_CHANNEL_ID and usd is not None and usd > LARGE_PAYOUT_THRESHOLD:
+                    target_id = LARGE_PAYOUT_CHANNEL_ID
+                target = bot.get_channel(target_id) or await bot.fetch_channel(target_id)
                 # Clean labelled layout - checks/notes stay in the private card only
                 text = (f"### Payout · <#{channel.id}>\n"
                         f"**User:** {username}\n"
