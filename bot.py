@@ -305,7 +305,7 @@ class ReplyView(discord.ui.View):
         self.reply = reply
         self.copy_reply.label = label
 
-    @discord.ui.button(label="Copy reply", style=discord.ButtonStyle.primary, emoji="📋")
+    @discord.ui.button(label="Copy reply", style=discord.ButtonStyle.primary, )
     async def copy_reply(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_message(self.reply[:2000], ephemeral=True)
 
@@ -381,13 +381,13 @@ async def payout(interaction: discord.Interaction):
     missing = [n for n, v in (("username", username), ("email", email), ("amount", amount),
                               ("network", network), ("address", wallet)) if v == "Not provided"]
 
-    embed = discord.Embed(title="💸 Payout", description=line, colour=0x2ECC71)
+    embed = discord.Embed(title="Payout", description=line, colour=0x2ECC71)
     embed.add_field(name="Copy & paste", value=f"```\n{line}\n```"[:1024], inline=False)
     note = (data.get("note") or "").strip()
     if missing:
         note = (f"Missing: {', '.join(missing)}. " + note).strip()
     if note:
-        embed.add_field(name="⚠️ Check", value=note[:1024], inline=False)
+        embed.add_field(name="Check", value=note[:1024], inline=False)
     embed.set_footer(text="AI-extracted: check the address against the user's message before sending.")
 
     # Auto-post the line into the payout channel (if one is set)
@@ -400,8 +400,15 @@ async def payout(interaction: discord.Interaction):
         else:
             try:
                 target = bot.get_channel(PAYOUT_CHANNEL_ID) or await bot.fetch_channel(PAYOUT_CHANNEL_ID)
-                # Just the line - checks/notes stay in the private card only
-                text = line
+                # Clean labelled layout - checks/notes stay in the private card only
+                text = (f"### Payout · <#{channel.id}>\n"
+                        f"**User:** {username}\n"
+                        f"**Email:** {email}\n"
+                        f"**Amount:** {amount}\n"
+                        f"**Network:** {network}\n"
+                        f"**Wallet:**\n"
+                        f"`{wallet}`\n"
+                        f"‎")  # invisible spacer so posts don't run together
                 await target.send(text[:2000], allowed_mentions=discord.AllowedMentions.none())
                 posted_to = target
             except Exception as e:
@@ -410,7 +417,7 @@ async def payout(interaction: discord.Interaction):
                                 inline=False)
 
     if posted_to:
-        embed.title = f"✅ Sent to #{posted_to.name}"
+        embed.title = f"Sent to #{posted_to.name}"
     await interaction.followup.send(embed=embed, view=ReplyView(line, label="Copy line"), ephemeral=True)
 
 
