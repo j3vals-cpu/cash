@@ -262,6 +262,7 @@ class TicketBot(discord.Client):
         # Live payout feed runs in the background alongside the commands
         self.payout_feed = PayoutFeed(self)
         self.loop.create_task(self.payout_feed.run())
+        self.loop.create_task(tracker.run())
 
 
 bot = TicketBot()
@@ -638,7 +639,7 @@ async def payout(interaction: discord.Interaction):
                     target_id = LARGE_PAYOUT_CHANNEL_ID
                 target = bot.get_channel(target_id) or await bot.fetch_channel(target_id)
                 # Clean labelled layout - checks/notes stay in the private card only
-                text = (f"### Payout · <#{channel.id}>\n"
+                text = (f"### PENDING · Payout · <#{channel.id}>\n"
                         f"**User:** {username}\n"
                         f"**Email:** {email}\n"
                         f"**Amount:** {amount}\n"
@@ -646,8 +647,10 @@ async def payout(interaction: discord.Interaction):
                         f"**Wallet:**\n"
                         f"`{wallet}`\n"
                         f"‎")  # invisible spacer so posts don't run together
-                await target.send(text[:2000], allowed_mentions=discord.AllowedMentions.none())
+                sent = await target.send(text[:2000], allowed_mentions=discord.AllowedMentions.none())
                 posted_to = target
+                tracker.add(sent)
+                asyncio.create_task(tracker.check())  # maybe it was already paid
             except Exception as e:
                 log.exception("Couldn't post to payout channel")
                 embed.add_field(name="Not posted", value=f"Couldn't post to the payout channel: {e}"[:1024],
@@ -698,6 +701,305 @@ async def run_extract(interaction, channel, transcript, image_urls, tool=None, s
         await interaction.followup.send(
             f"Couldn't read this ticket.\n-# Reason: {reason[:300]}", ephemeral=True)
         return None
+
+
+# --------------------------------------------------------------------------- #
+# Payout request tracking: PENDING -> PAID when the payout shows up on-chain
+# --------------------------------------------------------------------------- #
+
+REQ_HEADER_RE = re.compile(r"^### (?:(PENDING|PAID) · )?Payout · <#(\d+)>")
+REQ_WALLET_RE = re.compile(r"\*\*Wallet:\*\*\s*`([^`]+)`")
+REQ_AMOUNT_RE = re.compile(r"\*\*Amount:\*\*\s*([^\n]+)")
+TX_IN_TEXT_RE = re.compile(r"/tx/([0-9A-Za-z]{43,90})")
+PAID_EARLY_WINDOW = 24 * 3600  # a payout up to 24h before the request still counts (paid, then logged)
+
+
+class PayoutTracker:
+    def __init__(self):
+        self.pending: dict[int, dict] = {}   # message id -> request
+        self.used_tx: set[str] = set()       # transactions already matched to a request
+        self.loaded = False
+
+    @staticmethod
+    def parse(msg: discord.Message) -> dict | None:
+        m = REQ_HEADER_RE.match(msg.content or "")
+        w = REQ_WALLET_RE.search(msg.content or "")
+        if not m or not w:
+            return None
+        a = REQ_AMOUNT_RE.search(msg.content)
+        return {"msg": msg, "status": m.group(1) or "PENDING", "ticket": int(m.group(2)),
+                "wallet": w.group(1).strip(), "usd": usd_amount(a.group(1)) if a else None,
+                "created": int(msg.created_at.timestamp())}
+
+    def add(self, msg: discord.Message):
+        req = self.parse(msg)
+        if req and req["status"] == "PENDING":
+            self.pending[msg.id] = req
+
+    async def load(self):
+        """Pick up existing requests (including ones posted before tracking existed)."""
+        for cid in (PAYOUT_CHANNEL_ID, LARGE_PAYOUT_CHANNEL_ID):
+            if not cid:
+                continue
+            try:
+                ch = bot.get_channel(cid) or await bot.fetch_channel(cid)
+                async for msg in ch.history(limit=1000):
+                    if msg.author.id != bot.user.id:
+                        continue
+                    req = self.parse(msg)
+                    if not req:
+                        continue
+                    if req["status"] == "PAID":
+                        self.used_tx.update(t.lower() for t in TX_IN_TEXT_RE.findall(msg.content))
+                    else:
+                        self.pending[msg.id] = req
+            except Exception:
+                log.exception("Payout tracker: couldn't read channel %s", cid)
+        self.loaded = True
+        log.info("Payout tracker: %d request(s) still pending", len(self.pending))
+
+    def match(self, req: dict) -> dict | None:
+        """The on-chain payout that settles this request, if any."""
+        feed = getattr(bot, "payout_feed", None)
+        if not feed or not feed.index_ready:
+            return None
+        hits = [h for h in feed.find(req["wallet"])
+                if h["ts"] >= req["created"] - PAID_EARLY_WINDOW and h["hash"].lower() not in self.used_tx]
+        if not hits:
+            return None
+        want = req["usd"]
+        if want is not None:
+            close = [h for h in hits if h["usd"] is not None and abs(h["usd"] - want) <= max(1.0, want * 0.01)]
+            if close:
+                return min(close, key=lambda h: abs(h["usd"] - want))
+        return min(hits, key=lambda h: h["ts"])  # paid, but a different amount - flagged on the post
+
+    async def mark_paid(self, req: dict, hit: dict):
+        msg = req["msg"]
+        link = f"{EXPLORERS[hit['chain']]}{hit['hash']}"
+        paid_amt = f"${hit['usd']:,.2f}" if hit["usd"] is not None else f"{hit['amount']:,.4f} {hit['asset']}"
+        lines = msg.content.split("\n")
+        lines[0] = REQ_HEADER_RE.sub(lambda m: f"### PAID · Payout · <#{m.group(2)}>", lines[0])
+        info = [f"**Paid:** <t:{hit['ts']}:f> · [View transaction](<{link}>)"]
+        if req["usd"] is not None and hit["usd"] is not None and abs(hit["usd"] - req["usd"]) > max(1.0, req["usd"] * 0.01):
+            info.append(f"**Note:** paid {paid_amt}, requested ${req['usd']:,.2f}")
+        new = "\n".join([lines[0]] + info + lines[1:])
+        await msg.edit(content=new[:2000], allowed_mentions=discord.AllowedMentions.none())
+        self.used_tx.add(hit["hash"].lower())
+        self.pending.pop(msg.id, None)
+        log.info("Payout tracker: marked %s paid (%s)", msg.jump_url, paid_amt)
+
+    async def check(self):
+        for req in sorted(self.pending.values(), key=lambda r: r["created"]):
+            hit = self.match(req)
+            if hit:
+                try:
+                    await self.mark_paid(req, hit)
+                except Exception:
+                    log.exception("Payout tracker: couldn't update %s", req["msg"].jump_url)
+
+    async def run(self):
+        await bot.wait_until_ready()
+        if not (PAYOUT_CHANNEL_ID or LARGE_PAYOUT_CHANNEL_ID):
+            return
+        await self.load()
+        while True:
+            try:
+                await self.check()
+            except Exception:
+                log.exception("Payout tracker check failed")
+            await asyncio.sleep(60)
+
+
+tracker = PayoutTracker()
+
+
+# --------------------------------------------------------------------------- #
+# /check: review every request, then delete the paid ones + mark the rest PENDING
+# --------------------------------------------------------------------------- #
+
+async def scan_requests():
+    """Read every request in the payout channels and match each one against the blockchain."""
+    reqs = []
+    for cid in (PAYOUT_CHANNEL_ID, LARGE_PAYOUT_CHANNEL_ID):
+        if not cid:
+            continue
+        ch = bot.get_channel(cid) or await bot.fetch_channel(cid)
+        async for msg in ch.history(limit=1000):
+            if msg.author.id == bot.user.id:
+                req = PayoutTracker.parse(msg)
+                if req:
+                    reqs.append(req)
+    reqs.sort(key=lambda r: r["created"])
+
+    used = set()
+    for r in reqs:  # transactions already shown on PAID posts can't be reused
+        if r["status"] == "PAID":
+            used.update(t.lower() for t in TX_IN_TEXT_RE.findall(r["msg"].content))
+    saved, tracker.used_tx = tracker.used_tx, used
+    paid, flagged, waiting = [], [], []
+    try:
+        for r in reqs:
+            if r["status"] == "PAID":
+                paid.append((r, None))
+                continue
+            hit = tracker.match(r)
+            if not hit:
+                waiting.append(r)
+                continue
+            tracker.used_tx.add(hit["hash"].lower())
+            exact = (r["usd"] is None or hit["usd"] is None
+                     or abs(hit["usd"] - r["usd"]) <= max(1.0, r["usd"] * 0.01))
+            (paid if exact else flagged).append((r, hit))
+    finally:
+        tracker.used_tx = saved | tracker.used_tx
+    return paid, flagged, waiting
+
+
+def _req_line(r, hit=None):
+    amt = f"${r['usd']:,.2f}" if r["usd"] is not None else "?"
+    line = f"<#{r['ticket']}> · **{amt}**"
+    if hit:
+        got = f"${hit['usd']:,.2f}" if hit["usd"] is not None else f"{hit['amount']:,.4f} {hit['asset']}"
+        if got != amt:
+            line += f" · paid **{got}**"
+        line += f" · <t:{hit['ts']}:d> · [tx](<{EXPLORERS[hit['chain']]}{hit['hash']}>)"
+    elif r["status"] == "PAID":
+        line += " · already marked PAID"
+    return line + f" · [post]({r['msg'].jump_url})"
+
+
+def _chunks(title, lines, colour):
+    """Split a long list over several embeds (Discord limits)."""
+    embeds, buf = [], []
+    for ln in lines:
+        if sum(len(x) + 1 for x in buf) + len(ln) > 3900:
+            embeds.append(buf); buf = []
+        buf.append(ln)
+    if buf:
+        embeds.append(buf)
+    out = []
+    for i, part in enumerate(embeds):
+        out.append(discord.Embed(title=title if i == 0 else f"{title} (cont.)",
+                                 description="\n".join(part), colour=colour))
+    return out
+
+
+class CheckConfirm(discord.ui.View):
+    def __init__(self, user_id, paid, waiting):
+        super().__init__(timeout=900)
+        self.user_id, self.paid, self.waiting = user_id, paid, waiting
+
+    async def interaction_check(self, interaction):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("Only the person who ran /check can confirm.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Confirm: delete paid + mark rest PENDING", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(view=self)
+        deleted = marked = failed = 0
+        for r, hit in self.paid:
+            try:
+                if hit:
+                    tracker.used_tx.add(hit["hash"].lower())
+                await r["msg"].delete()
+                tracker.pending.pop(r["msg"].id, None)
+                deleted += 1
+            except Exception:
+                failed += 1
+            await asyncio.sleep(0.5)
+        for r in self.waiting:
+            msg = r["msg"]
+            try:
+                if not msg.content.startswith("### PENDING"):
+                    lines = msg.content.split("\n")
+                    lines[0] = REQ_HEADER_RE.sub(lambda m: f"### PENDING · Payout · <#{m.group(2)}>", lines[0])
+                    await msg.edit(content="\n".join(lines)[:2000], allowed_mentions=discord.AllowedMentions.none())
+                    marked += 1
+                tracker.pending[msg.id] = r
+            except Exception:
+                failed += 1
+            await asyncio.sleep(0.5)
+        text = f"Done. Deleted **{deleted}** paid post(s), marked **{marked}** post(s) PENDING."
+        if failed:
+            text += f" {failed} couldn't be changed (check the logs)."
+        await interaction.followup.send(text, ephemeral=True)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(content="Cancelled. Nothing was changed.", view=self)
+
+
+@bot.tree.command(name="check", description="Review every payout request vs the blockchain, then clean up")
+async def check(interaction: discord.Interaction):
+    if STAFF_ROLE_IDS and not is_staff(interaction.user):
+        await interaction.response.send_message("This command is for staff only.", ephemeral=True)
+        return
+    feed = getattr(bot, "payout_feed", None)
+    if not feed or not feed.index_ready:
+        await interaction.response.send_message("Still indexing the blockchain, try again in a few minutes.",
+                                                ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    paid, flagged, waiting = await scan_requests()
+
+    total = lambda items: sum((r["usd"] or 0) for r in items)
+    embeds = []
+    embeds += _chunks(f"PAID · {len(paid)} · ${total(r for r, _ in paid):,.2f} (will be deleted)",
+                      [_req_line(r, h) for r, h in paid] or ["None"], 0x22C55E)
+    if flagged:
+        embeds += _chunks(f"CHECK · {len(flagged)} · paid a different amount (kept, not deleted)",
+                          [_req_line(r, h) for r, h in flagged], 0xF59E0B)
+    embeds += _chunks(f"STILL WAITING · {len(waiting)} · ${total(waiting):,.2f} (will be marked PENDING)",
+                      [_req_line(r) for r in waiting] or ["None"], 0xEF4444)
+
+    summary = (f"**{len(paid)}** paid · **{len(flagged)}** to check · **{len(waiting)}** still waiting.\n"
+               f"Look through the list, then press **Confirm** to delete the paid posts and mark the rest PENDING.")
+    view = CheckConfirm(interaction.user.id, paid, waiting) if (paid or waiting) else None
+    # Discord: max 10 embeds and ~6000 characters per message - split into as many messages as needed
+    groups, cur, size = [], [], 0
+    for e in embeds:
+        n = len(e.title or "") + len(e.description or "")
+        if cur and (len(cur) == 10 or size + n > 5800):
+            groups.append(cur); cur, size = [], 0
+        cur.append(e); size += n
+    if cur:
+        groups.append(cur)
+    for g in groups[:-1]:
+        await interaction.followup.send(embeds=g, ephemeral=True)
+    await interaction.followup.send(summary, embeds=groups[-1], view=view or discord.utils.MISSING, ephemeral=True)
+
+
+@bot.tree.command(name="pending", description="Payout requests that still need paying")
+async def pending(interaction: discord.Interaction):
+    if STAFF_ROLE_IDS and not is_staff(interaction.user):
+        await interaction.response.send_message("This command is for staff only.", ephemeral=True)
+        return
+    if not tracker.loaded:
+        await interaction.response.send_message("Still loading payout requests, try again in a moment.",
+                                                ephemeral=True)
+        return
+    reqs = sorted(tracker.pending.values(), key=lambda r: r["created"])
+    if not reqs:
+        await interaction.response.send_message("Nothing pending. Every payout request has been paid.",
+                                                ephemeral=True)
+        return
+    total = sum(r["usd"] or 0 for r in reqs)
+    lines = [f"<#{r['ticket']}> · **${(r['usd'] or 0):,.2f}** · requested <t:{r['created']}:R> · "
+             f"[view]({r['msg'].jump_url})" for r in reqs]
+    embed = discord.Embed(title=f"Pending payouts · {len(reqs)} · ${total:,.2f}",
+                          description="\n".join(lines[:40])[:4000], colour=0xF59E0B)
+    if len(lines) > 40:
+        embed.set_footer(text=f"…and {len(lines) - 40} more (oldest shown first)")
+    else:
+        embed.set_footer(text="Oldest first. Updates automatically when payouts go out on-chain.")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 @bot.event
