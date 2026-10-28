@@ -77,6 +77,11 @@ CHAINS = {
 }
 NETWORKS = {c: {"explorer": v["explorer"], "name": v["name"]} for c, v in CHAINS.items()}
 NETWORKS["sol"] = {"explorer": "https://solscan.io/tx/", "name": "Solana"}
+NETWORK_ICONS = {
+    "bsc": "https://assets.coingecko.com/coins/images/825/large/bnb-icon2_2x.png",
+    "eth": "https://assets.coingecko.com/coins/images/279/large/ethereum.png",
+    "sol": "https://assets.coingecko.com/coins/images/4128/large/solana.png",
+}
 
 STABLES = {"USDC", "USDT", "BSC-USD"}
 TX_LINK_RE = re.compile(
@@ -111,6 +116,7 @@ class PayoutFeed:
         self.ledger_ready = False
         self.sol_last_sig: str | None = None   # newest Solana signature already handled
         self.sol_start_ts: int = 0
+        self.post_lock = asyncio.Lock()
         self.sol_tx_version = 1                      # Solana transaction format (auto-upgrades)
         self.sol_parsed: dict[str, list[dict]] = {}  # signature -> payouts found (cache for retries)
 
@@ -126,7 +132,9 @@ class PayoutFeed:
             try:
                 async with self.session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=30)) as r:
                     if r.status == 429:  # rate limited: slow down and retry
-                        await asyncio.sleep(1 + attempt)
+                        if attempt >= 2:
+                            log.warning("%s: rate limited by the network (try %d), slowing down", chain, attempt + 1)
+                        await asyncio.sleep(2 * (attempt + 1))
                         continue
                     data = await r.json(content_type=None)
                 err = data.get("error")
@@ -296,15 +304,19 @@ class PayoutFeed:
             colour=colour,
             timestamp=datetime.fromtimestamp(p["ts"], tz=timezone.utc),
         )
-        avatar = self.client.user.display_avatar.url if self.client.user else None
+        # Network logo + name up top so it's obvious where it came from; colour still = payout size.
         # tx link hidden behind the label (no hash shown) - also lets the bot remember what it posted
-        embed.set_author(name=label, icon_url=avatar, url=link)
+        embed.set_author(name=f"{cfg['name'].upper()}  ·  {label}", icon_url=NETWORK_ICONS.get(p["chain"]), url=link)
         embed.add_field(name="Asset", value=f"`{p['asset']}`", inline=True)
         embed.add_field(name="Network", value=f"`{cfg['name']}`", inline=True)
         embed.set_footer(text="Cashed  ·  Verified on-chain")
         return embed
 
     async def post(self, payouts: list[dict]):
+        async with self.post_lock:
+            await self._post(payouts)
+
+    async def _post(self, payouts: list[dict]):
         channel = self.client.get_channel(FEED_CHANNEL_ID) or await self.client.fetch_channel(FEED_CHANNEL_ID)
         payouts.sort(key=lambda p: (p["ts"], p["block"]))
         batch: list[discord.Embed] = []
@@ -411,6 +423,8 @@ class PayoutFeed:
                     log.exception("Payout feed couldn't start; retrying in 60s")
                     await asyncio.sleep(60)
 
+            if SOLANA_WALLET:
+                asyncio.create_task(self.sol_loop())  # Solana runs on its own; never blocks BSC/ETH
             nonces: dict[str, int | None] = {c: None for c in CHAINS}
             while True:
                 await self.poll(nonces)
@@ -437,13 +451,6 @@ class PayoutFeed:
             except Exception:
                 log.exception("Payout feed: %s scan failed; will retry next round", chain)
 
-        if SOLANA_WALLET:
-            try:
-                items, newest = await self.sol_scan()
-                results["sol"] = (items, newest, None)
-            except Exception:
-                log.exception("Payout feed: sol scan failed; will retry next round")
-
         found = [p for items, _, _ in results.values() for p in items]
         if found:
             log.info("Payout feed: %d transfer(s) found", len(found))
@@ -462,6 +469,19 @@ class PayoutFeed:
             nonces[chain] = nonce
 
     # ---------------------------------------------------------------- Solana
+    async def sol_loop(self):
+        while True:
+            try:
+                items, newest = await self.sol_scan()
+                if items:
+                    log.info("Payout feed: %d Solana transfer(s) found", len(items))
+                    await self.post(items)
+                if newest:
+                    self.sol_last_sig = newest
+            except Exception:
+                log.exception("Payout feed: sol scan failed; will retry next round (progress is kept)")
+            await asyncio.sleep(POLL_SECONDS)
+
     async def sol_scan(self) -> tuple[list[dict], str | None]:
         """New outgoing USDC/USDT transfers from the Solana wallet since the last scan.
         First scan goes back to the start time. Returns (payouts, newest signature seen)."""
