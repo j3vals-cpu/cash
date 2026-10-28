@@ -473,19 +473,34 @@ async def locate(interaction: discord.Interaction, amount: str):
 
     hits = feed.find_amount(usd)
     if not hits:
-        embed.description = f"No payout of exactly {shown} found on-chain."
+        embed.description = f"**NOT FOUND**\nNo payout of exactly {shown} has been sent on-chain."
+    confirmed_tickets = []
     for h in hits[:5]:
         wallets = h["to"] or []
-        lines = [f"<t:{h['ts']}:f> · {h['asset']} · {NETWORK_NAMES[h['chain']]} · "
-                 f"[tx]({EXPLORERS[h['chain']]}{h['hash']})"]
+        lines = [
+            "**Status:** SENT · confirmed on the blockchain",
+            f"**Date:** <t:{h['ts']}:f>",
+            f"**Network:** {h['asset']} · {NETWORK_NAMES[h['chain']]}",
+        ]
         for w in wallets[:2]:
-            lines.append(f"Sent to `{w}`")
+            lines.append(f"**Sent to:** `{w}`")
             mentions = await find_wallet_mentions(interaction.guild, w) if interaction.guild else []
             if mentions:
-                lines += [f"Ticket: <#{ch.id}> · [jump]({msg.jump_url})" for ch, msg in mentions[:3]]
+                for ch, msg in mentions[:3]:
+                    lines.append(f"**Ticket:** <#{ch.id}> · [jump]({msg.jump_url})")
+                    if ch.id not in confirmed_tickets:
+                        confirmed_tickets.append(ch.id)
             else:
-                lines.append("-# Wallet not found in any open ticket or payout channel")
-        embed.add_field(name=f"Payout {shown}", value="\n".join(lines)[:1024], inline=False)
+                lines.append("**Ticket:** wallet not found in any open ticket")
+        lines.append(f"[View transaction]({EXPLORERS[h['chain']]}{h['hash']})")
+        embed.add_field(name=f"PAID  {shown}", value="\n".join(lines)[:1024], inline=False)
+    if confirmed_tickets:
+        tickets = ", ".join(f"<#{c}>" for c in confirmed_tickets[:3])
+        embed.description = (f"**PAYOUT SENT**\nThis {shown} payout was sent to the wallet in {tickets}, "
+                             f"confirmed on the blockchain.")
+    elif hits:
+        embed.description = (f"**PAYOUT SENT**\nA {shown} payout was sent on-chain, but the receiving wallet "
+                             f"isn't in any open ticket.")
     if len(hits) > 5:
         embed.add_field(name="More", value=f"{len(hits) - 5} more payouts of {shown}; showing the newest 5.",
                         inline=False)
@@ -506,15 +521,27 @@ async def locate(interaction: discord.Interaction, amount: str):
                             value="\n".join(f"<#{ch.id}> · [jump]({msg.jump_url})" for ch, msg in uniq[:8])[:1024],
                             inline=False)
 
-    if hits:
-        embed.colour = 0x22C55E
+    embed.colour = 0x22C55E if hits else 0xEF4444
     embed.set_footer(text="Closed (deleted) tickets can't be searched.")
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
+PERIODS = {"all": (None, "All time"), "1d": (1, "Last 24 hours"), "7d": (7, "Last 7 days"),
+           "30d": (30, "Last 30 days"), "90d": (90, "Last 90 days")}
+
+
 @bot.tree.command(name="lifetime", description="Total amount Cashed has paid out to traders (on-chain)")
-@app_commands.describe(private="Only show it to you (default: post it in the channel)")
-async def lifetime(interaction: discord.Interaction, private: bool = False):
+@app_commands.describe(period="Time period (default: all time)",
+                       private="Only show it to you (default: post it in the channel)")
+@app_commands.choices(period=[
+    app_commands.Choice(name="All time", value="all"),
+    app_commands.Choice(name="Last 24 hours", value="1d"),
+    app_commands.Choice(name="Last 7 days", value="7d"),
+    app_commands.Choice(name="Last 30 days", value="30d"),
+    app_commands.Choice(name="Last 90 days", value="90d"),
+])
+async def lifetime(interaction: discord.Interaction, period: app_commands.Choice[str] = None,
+                   private: bool = False):
     feed = getattr(bot, "payout_feed", None)
     if not feed or not feed.enabled:
         await interaction.response.send_message("The payout feed isn't set up, so there are no totals yet.",
@@ -525,18 +552,25 @@ async def lifetime(interaction: discord.Interaction, private: bool = False):
                                                 ephemeral=True)
         return
 
-    s = feed.lifetime()
-    since = datetime.fromtimestamp(s["since"], tz=timezone.utc).strftime("%d %b %Y") if s["since"] else "-"
+    days, label = PERIODS[period.value if period else "all"]
+    s = feed.lifetime(days)
+    if days is None:
+        since = datetime.fromtimestamp(s["since"], tz=timezone.utc).strftime("%d %b %Y") if s["since"] else "-"
+        footer = f"Cashed  ·  Verified on-chain  ·  Since {since}"
+        title = "LIFETIME PAYOUTS"
+    else:
+        footer = f"Cashed  ·  Verified on-chain  ·  {label}"
+        title = f"PAYOUTS  ·  {label.upper()}"
     embed = discord.Embed(
         description=f"# ${s['total']:,.2f}\nTotal paid out to traders\n{'━' * 30}",
         colour=0x22C55E,
         timestamp=datetime.now(timezone.utc),
     )
-    embed.set_author(name="LIFETIME PAYOUTS", icon_url=bot.user.display_avatar.url)
+    embed.set_author(name=title, icon_url=bot.user.display_avatar.url)
     embed.add_field(name="Payouts", value=f"`{s['count']:,}`", inline=True)
     embed.add_field(name="Largest", value=f"`${s['largest']:,.2f}`", inline=True)
-    embed.add_field(name="Last 30 days", value=f"`${s['last30']:,.2f}`", inline=True)
-    embed.set_footer(text=f"Cashed  ·  Verified on-chain  ·  Since {since}")
+    embed.add_field(name="Average", value=f"`${s['average']:,.2f}`", inline=True)
+    embed.set_footer(text=footer)
     await interaction.response.send_message(embed=embed, ephemeral=private)
 
 
