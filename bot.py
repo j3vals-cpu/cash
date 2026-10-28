@@ -7,6 +7,7 @@ CASHED ticket summariser bot.
                ticket type, status and a short issue summary.
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -359,6 +360,156 @@ async def summarise(interaction: discord.Interaction, public: bool = False):
         await interaction.followup.send(embed=summary_embed)
         if solve_embed:
             await interaction.followup.send(embed=solve_embed, view=view, ephemeral=True)
+
+
+NETWORK_CHOICES = [
+    app_commands.Choice(name="Any network", value="any"),
+    app_commands.Choice(name="BNB Chain", value="bsc"),
+    app_commands.Choice(name="Ethereum", value="eth"),
+    app_commands.Choice(name="Solana", value="sol"),
+]
+NETWORK_NAMES = {"bsc": "BNB Chain", "eth": "Ethereum", "sol": "Solana"}
+EXPLORERS = {"bsc": "https://bscscan.com/tx/", "eth": "https://etherscan.io/tx/", "sol": "https://solscan.io/tx/"}
+TICKET_CATEGORY_WORDS = [w.strip().lower() for w in os.getenv("TICKET_CATEGORY_WORDS", "support,ticket").split(",") if w.strip()]
+FIND_SCAN_MESSAGES = int(os.getenv("FIND_SCAN_MESSAGES", "300"))
+
+
+async def find_wallet_mentions(guild: discord.Guild, wallet: str) -> list[tuple]:
+    """Channels (open tickets + payout channels) where the wallet was posted. Returns [(channel, message)]."""
+    w = wallet.strip().lower()
+    channels = [c for c in guild.text_channels
+                if c.category and any(word in c.category.name.lower() for word in TICKET_CATEGORY_WORDS)]
+    for cid in (PAYOUT_CHANNEL_ID, LARGE_PAYOUT_CHANNEL_ID):
+        ch = guild.get_channel(cid) if cid else None
+        if ch and ch not in channels:
+            channels.append(ch)
+
+    async def search(ch):
+        try:
+            async for msg in ch.history(limit=FIND_SCAN_MESSAGES):
+                text = msg.content + " " + " ".join(
+                    f"{e.description or ''} " + " ".join(f"{f.name} {f.value}" for f in e.fields) for e in msg.embeds)
+                if w in text.lower():
+                    return ch, msg
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+        return None
+
+    results = await asyncio.gather(*(search(c) for c in channels))
+    return [r for r in results if r]
+
+
+@bot.tree.command(name="find", description="Find payouts sent to a wallet, and the ticket it came from")
+@app_commands.describe(wallet="The trader's wallet address", network="Which network (default: any)")
+@app_commands.choices(network=NETWORK_CHOICES)
+async def find(interaction: discord.Interaction, wallet: str, network: app_commands.Choice[str] = None):
+    if STAFF_ROLE_IDS and not is_staff(interaction.user):
+        await interaction.response.send_message("This command is for staff only.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    net = None if network is None or network.value == "any" else network.value
+    wallet = wallet.strip().strip("`")
+
+    embed = discord.Embed(title="Wallet lookup", description=f"`{wallet}`", colour=0x3B82F6)
+
+    # 1) payouts on-chain
+    feed = getattr(bot, "payout_feed", None)
+    if not feed or not feed.enabled:
+        embed.add_field(name="Payouts", value="The payout feed isn't set up.", inline=False)
+    elif not feed.index_ready:
+        embed.add_field(name="Payouts", value="Still indexing the blockchain, try again in a few minutes.",
+                        inline=False)
+    else:
+        hits = feed.find(wallet, net)
+        if not hits:
+            where = NETWORK_NAMES.get(net, "any network")
+            embed.add_field(name="Payouts", value=f"No payouts found to this wallet on {where}.", inline=False)
+        else:
+            total = sum(h["usd"] or 0 for h in hits)
+            lines = []
+            for h in hits[:10]:
+                when = f"<t:{h['ts']}:d>"
+                amt = f"${h['usd']:,.2f}" if h["usd"] is not None else f"{h['amount']:,.4f} {h['asset']}"
+                lines.append(f"{when} · **{amt}** {h['asset']} · {NETWORK_NAMES[h['chain']]} · "
+                             f"[tx]({EXPLORERS[h['chain']]}{h['hash']})")
+            if len(hits) > 10:
+                lines.append(f"-# …and {len(hits) - 10} more")
+            embed.add_field(name=f"Payouts: {len(hits)} found · ${total:,.2f} total",
+                            value="\n".join(lines)[:1024], inline=False)
+            embed.colour = 0x22C55E
+
+    # 2) where it was mentioned (open tickets + payout channels)
+    mentions = await find_wallet_mentions(interaction.guild, wallet) if interaction.guild else []
+    if mentions:
+        embed.add_field(name="Mentioned in",
+                        value="\n".join(f"<#{ch.id}> · [jump to message]({msg.jump_url})"
+                                        for ch, msg in mentions[:10])[:1024], inline=False)
+    else:
+        embed.add_field(name="Mentioned in", value="Not found in any open ticket or payout channel.", inline=False)
+
+    embed.set_footer(text="Closed (deleted) tickets can't be searched.")
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="locate", description="Find which ticket a payout from the live feed belongs to")
+@app_commands.describe(amount="The amount shown in the live payout feed, e.g. 210.55")
+async def locate(interaction: discord.Interaction, amount: str):
+    if STAFF_ROLE_IDS and not is_staff(interaction.user):
+        await interaction.response.send_message("This command is for staff only.", ephemeral=True)
+        return
+    usd = usd_amount("$" + amount.replace("$", "").strip())
+    if usd is None:
+        await interaction.response.send_message("Type the amount like `210.55`.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    shown = f"${usd:,.2f}"
+    embed = discord.Embed(title=f"Locate {shown}", colour=0x3B82F6)
+
+    feed = getattr(bot, "payout_feed", None)
+    if not feed or not feed.enabled or not feed.index_ready:
+        await interaction.followup.send("The payout index isn't ready yet, try again in a few minutes.",
+                                        ephemeral=True)
+        return
+
+    hits = feed.find_amount(usd)
+    if not hits:
+        embed.description = f"No payout of exactly {shown} found on-chain."
+    for h in hits[:5]:
+        wallets = h["to"] or []
+        lines = [f"<t:{h['ts']}:f> · {h['asset']} · {NETWORK_NAMES[h['chain']]} · "
+                 f"[tx]({EXPLORERS[h['chain']]}{h['hash']})"]
+        for w in wallets[:2]:
+            lines.append(f"Sent to `{w}`")
+            mentions = await find_wallet_mentions(interaction.guild, w) if interaction.guild else []
+            if mentions:
+                lines += [f"Ticket: <#{ch.id}> · [jump]({msg.jump_url})" for ch, msg in mentions[:3]]
+            else:
+                lines.append("-# Wallet not found in any open ticket or payout channel")
+        embed.add_field(name=f"Payout {shown}", value="\n".join(lines)[:1024], inline=False)
+    if len(hits) > 5:
+        embed.add_field(name="More", value=f"{len(hits) - 5} more payouts of {shown}; showing the newest 5.",
+                        inline=False)
+
+    # Backup: tickets that mention the amount itself
+    if interaction.guild:
+        plain = f"{usd:,.2f}".replace(",", "")
+        amount_mentions = []
+        for text in {f"{usd:,.2f}", plain}:
+            amount_mentions += await find_wallet_mentions(interaction.guild, text)
+        seen_ids, uniq = set(), []
+        for ch, msg in amount_mentions:
+            if ch.id not in seen_ids:
+                seen_ids.add(ch.id)
+                uniq.append((ch, msg))
+        if uniq:
+            embed.add_field(name=f"Tickets mentioning {shown}",
+                            value="\n".join(f"<#{ch.id}> · [jump]({msg.jump_url})" for ch, msg in uniq[:8])[:1024],
+                            inline=False)
+
+    if hits:
+        embed.colour = 0x22C55E
+    embed.set_footer(text="Closed (deleted) tickets can't be searched.")
+    await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 @bot.tree.command(name="lifetime", description="Total amount Cashed has paid out to traders (on-chain)")
