@@ -10,6 +10,7 @@ it reads its own recent messages so nothing is posted twice.
 """
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -36,6 +37,10 @@ SOL_MINTS = {
     "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY8N1KxQLWPRnWdM": "USDT",
 }
 SOL_DELAY = float(os.getenv("SOLANA_DELAY", "0.3"))  # pause between lookups (public Solana RPC is rate-limited)
+
+# Where the payout index (who got paid what) is saved. Put a Railway Volume at /data to keep it across restarts.
+DATA_DIR = os.getenv("DATA_DIR") or ("/data" if os.path.isdir("/data") else os.path.join(os.path.dirname(os.path.abspath(__file__)), "data"))
+INDEX_FILE = os.path.join(DATA_DIR, "payout_index.json")
 
 RANGE_LIMIT_RE = re.compile(r"less than (\d+)")
 
@@ -117,6 +122,9 @@ class PayoutFeed:
         self.sol_last_sig: str | None = None   # newest Solana signature already handled
         self.sol_start_ts: int = 0
         self.post_lock = asyncio.Lock()
+        self.index = {"cursor": {}, "sol_last_sig": None, "payouts": {}}  # for /find
+        self.evm_synced = False
+        self.sol_synced = not SOLANA_WALLET
         self.sol_tx_version = 1                      # Solana transaction format (auto-upgrades)
         self.sol_parsed: dict[str, list[dict]] = {}  # signature -> payouts found (cache for retries)
 
@@ -252,6 +260,7 @@ class PayoutFeed:
             "ts": _int(t.get("blockTimeStamp") or t.get("blockTimestamp")),
             "asset": asset,
             "amount": amount,
+            "to": [to_addr],
         }
 
     # ---------------------------------------------------------------- prices
@@ -392,6 +401,55 @@ class PayoutFeed:
             "since": min((ts for _, ts in values), default=None),
         }
 
+    # ----------------------------------------------------------------- index
+    def load_index(self):
+        try:
+            with open(INDEX_FILE, encoding="utf-8") as f:
+                data = json.load(f)
+            self.index.update(data)
+            log.info("Payout index loaded: %d payouts", len(self.index["payouts"]))
+        except FileNotFoundError:
+            log.info("No payout index yet; it will be built from the blockchain")
+        except Exception:
+            log.exception("Couldn't read payout index; rebuilding it")
+
+    def save_index(self):
+        try:
+            os.makedirs(DATA_DIR, exist_ok=True)
+            tmp = INDEX_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self.index, f)
+            os.replace(tmp, INDEX_FILE)
+        except Exception:
+            log.exception("Couldn't save payout index")
+
+    async def record(self, items: list[dict]):
+        """Remember who each payout went to (for /find)."""
+        for p in items:
+            usd = await self.usd_value(p)
+            self.index["payouts"][p["hash"].lower()] = {
+                "chain": p["chain"], "hash": p["hash"], "to": p.get("to") or [],
+                "asset": p["asset"], "amount": p["amount"], "usd": usd, "ts": p["ts"],
+            }
+
+    @property
+    def index_ready(self) -> bool:
+        return self.evm_synced and self.sol_synced
+
+    def find(self, wallet: str, network: str | None = None) -> list[dict]:
+        """All payouts sent to a wallet, newest first. network: 'bsc', 'eth', 'sol' or None for any."""
+        w = wallet.strip().lower()
+        hits = [p for p in self.index["payouts"].values()
+                if (network is None or p["chain"] == network)
+                and any((t or "").lower() == w for t in p["to"])]
+        return sorted(hits, key=lambda p: p["ts"], reverse=True)
+
+    def find_amount(self, usd: float, tolerance: float = 0.01) -> list[dict]:
+        """Payouts whose dollar value matches (within a cent), newest first."""
+        hits = [p for p in self.index["payouts"].values()
+                if p.get("usd") is not None and abs(p["usd"] - usd) <= tolerance]
+        return sorted(hits, key=lambda p: p["ts"], reverse=True)
+
     async def run(self):
         if not self.enabled:
             log.info("Payout feed off (set NODEREAL_API_KEY and FEED_CHANNEL_ID to turn it on)")
@@ -412,12 +470,20 @@ class PayoutFeed:
                                        .replace(tzinfo=timezone.utc).timestamp())
                         log.info("Payout feed first run: posting history since %s (this can take a few minutes)",
                                  HISTORY_START)
+                    self.load_index()
+                    history_ts = int(datetime.fromisoformat(HISTORY_START)
+                                     .replace(tzinfo=timezone.utc).timestamp())
                     for chain in CHAINS:
-                        self.cursor[chain] = await self.block_at(chain, start_ts)
-                    # Solana: always scan its full history the first time (it may be newer than
-                    # the channel's posts); already-posted payouts are skipped via their links.
-                    self.sol_start_ts = int(datetime.fromisoformat(HISTORY_START)
-                                            .replace(tzinfo=timezone.utc).timestamp())
+                        resume = await self.block_at(chain, start_ts)
+                        indexed = self.index["cursor"].get(chain) if last_post else None
+                        if indexed is None:  # index not built yet: scan the full history (no reposts)
+                            indexed = await self.block_at(chain, history_ts)
+                        self.cursor[chain] = min(resume, indexed)
+                    # Solana: carry on from the index if we have one, otherwise scan its full history.
+                    # Already-posted payouts are always skipped via their links.
+                    self.sol_start_ts = history_ts
+                    if last_post and self.index.get("sol_last_sig"):
+                        self.sol_last_sig = self.index["sol_last_sig"]
                     break
                 except Exception:
                     log.exception("Payout feed couldn't start; retrying in 60s")
@@ -452,6 +518,7 @@ class PayoutFeed:
                 log.exception("Payout feed: %s scan failed; will retry next round", chain)
 
         found = [p for items, _, _ in results.values() for p in items]
+        await self.record(found)
         if found:
             log.info("Payout feed: %d transfer(s) found", len(found))
             try:
@@ -467,17 +534,25 @@ class PayoutFeed:
                 continue
             self.cursor[chain] = safe + 1
             nonces[chain] = nonce
+            self.index["cursor"][chain] = self.cursor[chain]
+        if results and len([c for c in results if c != "sol"]) == len(CHAINS):
+            self.evm_synced = True
+        self.save_index()
 
     # ---------------------------------------------------------------- Solana
     async def sol_loop(self):
         while True:
             try:
                 items, newest = await self.sol_scan()
+                await self.record(items)
                 if items:
                     log.info("Payout feed: %d Solana transfer(s) found", len(items))
                     await self.post(items)
                 if newest:
                     self.sol_last_sig = newest
+                    self.index["sol_last_sig"] = newest
+                self.sol_synced = True
+                self.save_index()
             except Exception:
                 log.exception("Payout feed: sol scan failed; will retry next round (progress is kept)")
             await asyncio.sleep(POLL_SECONDS)
@@ -572,6 +647,7 @@ class PayoutFeed:
                 "ts": sig.get("blockTime") or tx.get("blockTime") or 0,
                 "asset": asset,
                 "amount": round(sent, 6),
+                "to": receivers,
             })
         if out:
             return out  # token payout found; any SOL change here is just fees/rent
@@ -600,4 +676,5 @@ class PayoutFeed:
             "ts": sig.get("blockTime") or tx.get("blockTime") or 0,
             "asset": "SOL",
             "amount": round(lamports / 1e9, 6),
+            "to": receivers,
         }]
