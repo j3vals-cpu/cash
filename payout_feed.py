@@ -2,7 +2,7 @@
 Live payout feed.
 
 Watches the CASHED payout wallets - BNB Smart Chain (USDC), Ethereum (ETH + USDC)
-and Solana (USDC + USDT) - and posts each outgoing transfer to a Discord channel as a card.
+and Solana (SOL + USDC + USDT) - and posts each outgoing transfer to a Discord channel as a card.
 
 On first run it posts the whole history (oldest first, grouped into messages).
 After that it polls for new payouts. The tx links double as memory: on restart
@@ -246,26 +246,30 @@ class PayoutFeed:
 
     # ---------------------------------------------------------------- prices
     async def eth_usd(self, ts: int) -> float | None:
+        return await self.price_usd("ETHUSDT", ts)
+
+    async def price_usd(self, symbol: str, ts: int) -> float | None:
+        """Coin price in USD at the minute of the payout."""
         minute = ts // 60 * 60
-        if minute in self.price_cache:
-            return self.price_cache[minute]
+        if (symbol, minute) in self.price_cache:
+            return self.price_cache[(symbol, minute)]
         url = "https://data-api.binance.vision/api/v3/klines"
-        params = {"symbol": "ETHUSDT", "interval": "1m", "startTime": minute * 1000, "limit": 1}
+        params = {"symbol": symbol, "interval": "1m", "startTime": minute * 1000, "limit": 1}
         try:
             async with self.session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=15)) as r:
                 rows = await r.json(content_type=None)
             price = float(rows[0][4])
         except Exception:
-            log.warning("Couldn't get ETH price for %s", minute, exc_info=True)
+            log.warning("Couldn't get %s price for %s", symbol, minute, exc_info=True)
             return None
-        self.price_cache[minute] = price
+        self.price_cache[(symbol, minute)] = price
         return price
 
     async def usd_value(self, p: dict) -> float | None:
         if p["asset"] in STABLES:
             return p["amount"]
-        if p["asset"] == "ETH":
-            price = await self.eth_usd(p["ts"])
+        if p["asset"] in ("ETH", "SOL"):
+            price = await self.price_usd(f"{p['asset']}USDT", p["ts"])
             return p["amount"] * price if price else None
         return None
 
@@ -396,7 +400,10 @@ class PayoutFeed:
                                  HISTORY_START)
                     for chain in CHAINS:
                         self.cursor[chain] = await self.block_at(chain, start_ts)
-                    self.sol_start_ts = start_ts
+                    # Solana: always scan its full history the first time (it may be newer than
+                    # the channel's posts); already-posted payouts are skipped via their links.
+                    self.sol_start_ts = int(datetime.fromisoformat(HISTORY_START)
+                                            .replace(tzinfo=timezone.utc).timestamp())
                     break
                 except Exception:
                     log.exception("Payout feed couldn't start; retrying in 60s")
@@ -478,6 +485,9 @@ class PayoutFeed:
             await asyncio.sleep(SOL_DELAY)
 
         newest = sigs[0]["signature"] if sigs else None
+        if not self.sol_last_sig:
+            log.info("Payout feed: Solana first scan, %d transaction(s) to check (this can take a few minutes)",
+                     len(sigs))
         out = []
         for s in reversed(sigs):  # oldest first
             if s.get("err") is not None or s["signature"].lower() in self.seen:
@@ -521,4 +531,31 @@ class PayoutFeed:
                 "asset": asset,
                 "amount": round(sent, 6),
             })
-        return out
+        if out:
+            return out  # token payout found; any SOL change here is just fees/rent
+
+        # Native SOL payout: the wallet's SOL went down by more than the network fee
+        keys = [k.get("pubkey") if isinstance(k, dict) else k
+                for k in ((tx.get("transaction") or {}).get("message") or {}).get("accountKeys") or []]
+        if SOLANA_WALLET not in keys:
+            return []
+        i = keys.index(SOLANA_WALLET)
+        pre_b, post_b = meta.get("preBalances") or [], meta.get("postBalances") or []
+        if i >= len(pre_b) or i >= len(post_b):
+            return []
+        fee = (meta.get("fee") or 0) if i == 0 else 0  # fee payer is always account 0
+        lamports = pre_b[i] - post_b[i] - fee
+        if lamports <= 0:
+            return []
+        receivers = [keys[j] for j in range(min(len(keys), len(pre_b), len(post_b)))
+                     if j != i and post_b[j] > pre_b[j]]
+        if not receivers or any(r.lower() in SKIP_ADDRESSES for r in receivers):
+            return []
+        return [{
+            "chain": "sol",
+            "hash": sig["signature"],
+            "block": sig.get("slot") or tx.get("slot") or 0,
+            "ts": sig.get("blockTime") or tx.get("blockTime") or 0,
+            "asset": "SOL",
+            "amount": round(lamports / 1e9, 6),
+        }]
