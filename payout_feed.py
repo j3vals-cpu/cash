@@ -1,10 +1,8 @@
 """
 Live payout feed.
 
-Watches the CASHED payout wallet on BNB Smart Chain (USDC) and Ethereum (ETH + USDC)
-and posts each outgoing transfer to a Discord channel, e.g.
-
-    ✅ Payout sent! **Trader** has just received **$812.62**. Congratulations! [🔗](<tx link>)
+Watches the CASHED payout wallets - BNB Smart Chain (USDC), Ethereum (ETH + USDC)
+and Solana (USDC + USDT) - and posts each outgoing transfer to a Discord channel as a card.
 
 On first run it posts the whole history (oldest first, grouped into messages).
 After that it polls for new payouts. The tx links double as memory: on restart
@@ -29,6 +27,15 @@ HISTORY_START = os.getenv("HISTORY_START", "2026-06-25")  # wallet was funded ~l
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "60"))
 MIN_PAYOUT_USD = float(os.getenv("MIN_PAYOUT_USD", "1"))
 SKIP_ADDRESSES = {a.strip().lower() for a in os.getenv("SKIP_ADDRESSES", "").split(",") if a.strip()}
+
+# Solana payout wallet (Solana addresses are case-sensitive - don't lowercase)
+SOLANA_WALLET = os.getenv("SOLANA_WALLET", "AgP3yC6cGup9XCaMihzJU9FQsHFW6ZznZ9noPpg8kz8n").strip()
+SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
+SOL_MINTS = {
+    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v": "USDC",
+    "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY8N1KxQLWPRnWdM": "USDT",
+}
+SOL_DELAY = float(os.getenv("SOLANA_DELAY", "0.3"))  # pause between lookups (public Solana RPC is rate-limited)
 
 RANGE_LIMIT_RE = re.compile(r"less than (\d+)")
 
@@ -68,8 +75,20 @@ CHAINS = {
         "lag": 5,
     },
 }
+NETWORKS = {c: {"explorer": v["explorer"], "name": v["name"]} for c, v in CHAINS.items()}
+NETWORKS["sol"] = {"explorer": "https://solscan.io/tx/", "name": "Solana"}
+
 STABLES = {"USDC", "USDT", "BSC-USD"}
-TX_LINK_RE = re.compile(r"(bscscan\.com|etherscan\.io)/tx/(0x[0-9a-fA-F]{64})")
+TX_LINK_RE = re.compile(
+    r"(bscscan\.com|etherscan\.io|solscan\.io)/tx/(0x[0-9a-fA-F]{64}|[1-9A-HJ-NP-Za-km-z]{64,90})")
+
+
+USD_RE = re.compile(r"\$\s*([\d,]+(?:\.\d+)?)")
+
+
+def _first_usd(text: str):
+    m = USD_RE.search(text or "")
+    return float(m.group(1).replace(",", "")) if m else None
 
 
 def _int(x) -> int:
@@ -88,6 +107,10 @@ class PayoutFeed:
         self.cursor: dict[str, int] = {}
         self.seen: set[str] = set()
         self.price_cache: dict[int, float] = {}
+        self.ledger: dict[str, tuple[float, int]] = {}  # tx hash -> (usd, unix time)
+        self.ledger_ready = False
+        self.sol_last_sig: str | None = None   # newest Solana signature already handled
+        self.sol_start_ts: int = 0
 
     @property
     def enabled(self) -> bool:
@@ -95,7 +118,7 @@ class PayoutFeed:
 
     # ------------------------------------------------------------------ RPC
     async def rpc(self, chain: str, method: str, params: list):
-        url = CHAINS[chain]["rpc"].format(key=NODEREAL_API_KEY)
+        url = SOLANA_RPC_URL if chain == "sol" else CHAINS[chain]["rpc"].format(key=NODEREAL_API_KEY)
         payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
         for attempt in range(6):
             try:
@@ -256,7 +279,7 @@ class PayoutFeed:
             amount = f"${usd:,.2f}"
         else:
             amount = f"{p['amount']:,.4f} {p['asset']}"
-        cfg = CHAINS[p["chain"]]
+        cfg = NETWORKS[p["chain"]]
         link = cfg["explorer"] + p["hash"]
         colour, label = tier_for(usd)
 
@@ -280,12 +303,16 @@ class PayoutFeed:
         payouts.sort(key=lambda p: (p["ts"], p["block"]))
         batch: list[discord.Embed] = []
         for p in payouts:
-            if p["hash"] in self.seen:
+            key = p["hash"].lower()
+            if key in self.seen:
                 continue
             card = await self.build_card(p)
-            self.seen.add(p["hash"])
+            self.seen.add(key)
             if not card:
                 continue
+            usd = await self.usd_value(p)
+            if usd is not None:
+                self.ledger[key] = (usd, p["ts"])
             batch.append(card)
             if len(batch) == 10:  # Discord allows 10 cards per message
                 await channel.send(embeds=batch)
@@ -296,20 +323,56 @@ class PayoutFeed:
 
     # ------------------------------------------------------------- lifecycle
     async def load_state(self) -> datetime | None:
-        """Read our own recent posts: remember tx hashes and when we last posted."""
+        """Read all our posts in the feed channel: remember tx hashes (no double posts)
+        and each payout's amount (for /lifetime). Returns when we last posted."""
         channel = self.client.get_channel(FEED_CHANNEL_ID) or await self.client.fetch_channel(FEED_CHANNEL_ID)
         last_post = None
-        async for msg in channel.history(limit=1000):
+        async for msg in channel.history(limit=None):
             if msg.author.id != self.client.user.id:
                 continue
-            text = msg.content + " " + " ".join(
-                f"{e.url or ''} {getattr(e.author, 'url', None) or ''} {e.description or ''} " + " ".join(f.value or "" for f in e.fields)
-                for e in msg.embeds)
-            hashes = [h.lower() for _, h in TX_LINK_RE.findall(text)]
-            if hashes:
+            found = False
+            # current style: one payout per card
+            for e in msg.embeds:
+                text = (f"{e.url or ''} {getattr(e.author, 'url', None) or ''} {e.description or ''} "
+                        + " ".join(f.value or "" for f in e.fields))
+                hashes = [h.lower() for _, h in TX_LINK_RE.findall(text)]
+                if not hashes:
+                    continue
+                found = True
                 self.seen.update(hashes)
+                usd = _first_usd(e.description or "")
+                if usd is not None:
+                    ts = int((e.timestamp or msg.created_at).timestamp())
+                    self.ledger[hashes[0]] = (usd, ts)
+            # older plain-text style: one payout per line
+            for line in msg.content.splitlines():
+                hashes = [h.lower() for _, h in TX_LINK_RE.findall(line)]
+                if not hashes:
+                    continue
+                found = True
+                self.seen.update(hashes)
+                usd = _first_usd(line)
+                if usd is not None:
+                    self.ledger[hashes[0]] = (usd, int(msg.created_at.timestamp()))
+            if found:
                 last_post = last_post or msg.created_at
+        self.ledger_ready = True
+        log.info("Payout feed: %d payouts on record, $%s lifetime", len(self.ledger),
+                 f"{sum(v for v, _ in self.ledger.values()):,.2f}")
         return last_post
+
+    def lifetime(self) -> dict:
+        """Totals for /lifetime."""
+        values = list(self.ledger.values())
+        now = datetime.now(timezone.utc).timestamp()
+        recent = [v for v, ts in values if ts >= now - 30 * 86400]
+        return {
+            "total": sum(v for v, _ in values),
+            "count": len(values),
+            "largest": max((v for v, _ in values), default=0.0),
+            "last30": sum(recent),
+            "since": min((ts for _, ts in values), default=None),
+        }
 
     async def run(self):
         if not self.enabled:
@@ -333,6 +396,7 @@ class PayoutFeed:
                                  HISTORY_START)
                     for chain in CHAINS:
                         self.cursor[chain] = await self.block_at(chain, start_ts)
+                    self.sol_start_ts = start_ts
                     break
                 except Exception:
                     log.exception("Payout feed couldn't start; retrying in 60s")
@@ -364,6 +428,13 @@ class PayoutFeed:
             except Exception:
                 log.exception("Payout feed: %s scan failed; will retry next round", chain)
 
+        if SOLANA_WALLET:
+            try:
+                items, newest = await self.sol_scan()
+                results["sol"] = (items, newest, None)
+            except Exception:
+                log.exception("Payout feed: sol scan failed; will retry next round")
+
         found = [p for items, _, _ in results.values() for p in items]
         if found:
             log.info("Payout feed: %d transfer(s) found", len(found))
@@ -374,5 +445,80 @@ class PayoutFeed:
                 return  # don't move cursors, so these get retried (already-posted ones are skipped)
 
         for chain, (_, safe, nonce) in results.items():
+            if chain == "sol":
+                if safe:
+                    self.sol_last_sig = safe
+                continue
             self.cursor[chain] = safe + 1
             nonces[chain] = nonce
+
+    # ---------------------------------------------------------------- Solana
+    async def sol_scan(self) -> tuple[list[dict], str | None]:
+        """New outgoing USDC/USDT transfers from the Solana wallet since the last scan.
+        First scan goes back to the start time. Returns (payouts, newest signature seen)."""
+        sigs, before = [], None
+        while True:
+            opts = {"limit": 1000, "commitment": "confirmed"}
+            if before:
+                opts["before"] = before
+            if self.sol_last_sig:
+                opts["until"] = self.sol_last_sig
+            page = await self.rpc("sol", "getSignaturesForAddress", [SOLANA_WALLET, opts])
+            if not page:
+                break
+            stop = False
+            for s in page:  # newest first
+                if not self.sol_last_sig and (s.get("blockTime") or 0) < self.sol_start_ts:
+                    stop = True
+                    break
+                sigs.append(s)
+            if stop or len(page) < 1000:
+                break
+            before = page[-1]["signature"]
+            await asyncio.sleep(SOL_DELAY)
+
+        newest = sigs[0]["signature"] if sigs else None
+        out = []
+        for s in reversed(sigs):  # oldest first
+            if s.get("err") is not None or s["signature"].lower() in self.seen:
+                continue
+            tx = await self.rpc("sol", "getTransaction", [s["signature"], {
+                "encoding": "jsonParsed", "maxSupportedTransactionVersion": 0, "commitment": "confirmed"}])
+            await asyncio.sleep(SOL_DELAY)
+            out += self._sol_parse(s, tx)
+        return out, newest
+
+    def _sol_parse(self, sig: dict, tx: dict | None) -> list[dict]:
+        if not tx or not tx.get("meta") or tx["meta"].get("err") is not None:
+            return []
+        meta = tx["meta"]
+
+        def balances(rows):
+            b = {}
+            for r in rows or []:
+                mint, owner = r.get("mint"), r.get("owner")
+                if mint in SOL_MINTS and owner:
+                    amt = float((r.get("uiTokenAmount") or {}).get("uiAmountString") or 0)
+                    b[(owner, mint)] = b.get((owner, mint), 0.0) + amt
+            return b
+
+        pre, post = balances(meta.get("preTokenBalances")), balances(meta.get("postTokenBalances"))
+        out = []
+        for mint, asset in SOL_MINTS.items():
+            sent = pre.get((SOLANA_WALLET, mint), 0.0) - post.get((SOLANA_WALLET, mint), 0.0)
+            if sent <= 0:
+                continue
+            receivers = [o for (o, m) in set(pre) | set(post)
+                         if m == mint and o != SOLANA_WALLET
+                         and post.get((o, m), 0.0) - pre.get((o, m), 0.0) > 0]
+            if any(r.lower() in SKIP_ADDRESSES for r in receivers):
+                continue
+            out.append({
+                "chain": "sol",
+                "hash": sig["signature"],
+                "block": sig.get("slot") or tx.get("slot") or 0,
+                "ts": sig.get("blockTime") or tx.get("blockTime") or 0,
+                "asset": asset,
+                "amount": round(sent, 6),
+            })
+        return out
