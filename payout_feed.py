@@ -258,7 +258,6 @@ class PayoutFeed:
             amount = f"{p['amount']:,.4f} {p['asset']}"
         cfg = CHAINS[p["chain"]]
         link = cfg["explorer"] + p["hash"]
-        short = f"{p['hash'][:6]}…{p['hash'][-4:]}"
         colour, label = tier_for(usd)
 
         embed = discord.Embed(
@@ -269,10 +268,10 @@ class PayoutFeed:
             timestamp=datetime.fromtimestamp(p["ts"], tz=timezone.utc),
         )
         avatar = self.client.user.display_avatar.url if self.client.user else None
-        embed.set_author(name=label, icon_url=avatar)
+        # tx link hidden behind the label (no hash shown) - also lets the bot remember what it posted
+        embed.set_author(name=label, icon_url=avatar, url=link)
         embed.add_field(name="Asset", value=f"`{p['asset']}`", inline=True)
         embed.add_field(name="Network", value=f"`{cfg['name']}`", inline=True)
-        embed.add_field(name="Transaction", value=f"[{short}]({link})", inline=True)
         embed.set_footer(text="Cashed  ·  Verified on-chain")
         return embed
 
@@ -304,7 +303,7 @@ class PayoutFeed:
             if msg.author.id != self.client.user.id:
                 continue
             text = msg.content + " " + " ".join(
-                f"{e.url or ''} {e.description or ''} " + " ".join(f.value or "" for f in e.fields)
+                f"{e.url or ''} {getattr(e.author, 'url', None) or ''} {e.description or ''} " + " ".join(f.value or "" for f in e.fields)
                 for e in msg.embeds)
             hashes = [h.lower() for _, h in TX_LINK_RE.findall(text)]
             if hashes:
