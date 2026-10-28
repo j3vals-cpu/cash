@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 from datetime import datetime, timezone
 
 import discord
@@ -415,90 +416,81 @@ async def find_wallet_mentions(guild: discord.Guild, wallet: str) -> list[tuple]
     return [r for r in results if r]
 
 
-@bot.tree.command(name="find", description="Find payouts sent to a wallet, and the ticket it came from")
-@app_commands.describe(wallet="The trader's wallet address", network="Which network (default: any)")
+AMOUNT_RE = re.compile(r"^\$?\s*[\d,]+(?:\.\d+)?$")
+
+
+@bot.tree.command(name="find", description="Look up a payout by wallet address or by amount")
+@app_commands.describe(search="A wallet address, or an amount from the live feed (e.g. 210.55)",
+                       network="Which network (default: any)")
 @app_commands.choices(network=NETWORK_CHOICES)
-async def find(interaction: discord.Interaction, wallet: str, network: app_commands.Choice[str] = None):
+async def find(interaction: discord.Interaction, search: str, network: app_commands.Choice[str] = None):
     if STAFF_ROLE_IDS and not is_staff(interaction.user):
         await interaction.response.send_message("This command is for staff only.", ephemeral=True)
         return
-    await interaction.response.defer(ephemeral=True, thinking=True)
+    search = search.strip().strip("`")
     net = None if network is None or network.value == "any" else network.value
-    wallet = wallet.strip().strip("`")
 
-    embed = discord.Embed(title="Wallet lookup", description=f"`{wallet}`", colour=0x3B82F6)
-
-    # 1) payouts on-chain
     feed = getattr(bot, "payout_feed", None)
     if not feed or not feed.enabled:
-        embed.add_field(name="Payouts", value="The payout feed isn't set up.", inline=False)
-    elif not feed.index_ready:
-        embed.add_field(name="Payouts", value="Still indexing the blockchain, try again in a few minutes.",
-                        inline=False)
-    else:
-        hits = feed.find(wallet, net)
-        if not hits:
-            where = NETWORK_NAMES.get(net, "any network")
-            embed.add_field(name="Payouts", value=f"No payouts found to this wallet on {where}.", inline=False)
-        else:
-            total = sum(h["usd"] or 0 for h in hits)
-            lines = []
-            for h in hits[:10]:
-                when = f"<t:{h['ts']}:d>"
-                amt = f"${h['usd']:,.2f}" if h["usd"] is not None else f"{h['amount']:,.4f} {h['asset']}"
-                lines.append(f"{when} · **{amt}** {h['asset']} · {NETWORK_NAMES[h['chain']]} · "
-                             f"[tx]({EXPLORERS[h['chain']]}{h['hash']})")
-            if len(hits) > 10:
-                lines.append(f"-# …and {len(hits) - 10} more")
-            embed.add_field(name=f"Payouts: {len(hits)} found · ${total:,.2f} total",
-                            value="\n".join(lines)[:1024], inline=False)
-            embed.colour = 0x22C55E
+        await interaction.response.send_message("The payout feed isn't set up.", ephemeral=True)
+        return
+    if not feed.index_ready:
+        await interaction.response.send_message("Still indexing the blockchain, try again in a few minutes.",
+                                                ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
 
-    # 2) where it was mentioned (open tickets + payout channels)
-    mentions = await find_wallet_mentions(interaction.guild, wallet) if interaction.guild else []
-    if mentions:
-        embed.add_field(name="Mentioned in",
-                        value="\n".join(f"<#{ch.id}> · [jump to message]({msg.jump_url})"
-                                        for ch, msg in mentions[:10])[:1024], inline=False)
+    if AMOUNT_RE.match(search):
+        embed = await lookup_amount(interaction, feed, usd_amount("$" + search.replace("$", "")), net)
     else:
-        embed.add_field(name="Mentioned in", value="Not found in any open ticket or payout channel.", inline=False)
-
+        embed = await lookup_wallet(interaction, feed, search, net)
     embed.set_footer(text="Closed (deleted) tickets can't be searched.")
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
-@bot.tree.command(name="locate", description="Find which ticket a payout from the live feed belongs to")
-@app_commands.describe(amount="The amount shown in the live payout feed, e.g. 210.55")
-async def locate(interaction: discord.Interaction, amount: str):
-    if STAFF_ROLE_IDS and not is_staff(interaction.user):
-        await interaction.response.send_message("This command is for staff only.", ephemeral=True)
-        return
-    usd = usd_amount("$" + amount.replace("$", "").strip())
-    if usd is None:
-        await interaction.response.send_message("Type the amount like `210.55`.", ephemeral=True)
-        return
-    await interaction.response.defer(ephemeral=True, thinking=True)
+async def lookup_wallet(interaction, feed, wallet: str, net: str | None) -> discord.Embed:
+    """Every payout sent to a wallet + where the wallet was posted."""
+    embed = discord.Embed(title="Wallet lookup", description=f"`{wallet}`", colour=0xEF4444)
+    hits = feed.find(wallet, net)
+    if not hits:
+        where = NETWORK_NAMES.get(net, "any network")
+        embed.add_field(name="NOT FOUND", value=f"No payouts have been sent to this wallet on {where}.",
+                        inline=False)
+    else:
+        total = sum(h["usd"] or 0 for h in hits)
+        lines = []
+        for h in hits[:10]:
+            amt = f"${h['usd']:,.2f}" if h["usd"] is not None else f"{h['amount']:,.4f} {h['asset']}"
+            lines.append(f"<t:{h['ts']}:d> · **{amt}** {h['asset']} · {NETWORK_NAMES[h['chain']]} · "
+                         f"[tx]({EXPLORERS[h['chain']]}{h['hash']})")
+        if len(hits) > 10:
+            lines.append(f"-# …and {len(hits) - 10} more")
+        embed.add_field(name=f"PAID  ·  {len(hits)} payout(s) · ${total:,.2f} total",
+                        value="\n".join(lines)[:1024], inline=False)
+        embed.colour = 0x22C55E
+
+    mentions = await find_wallet_mentions(interaction.guild, wallet) if interaction.guild else []
+    embed.add_field(name="Ticket",
+                    value="\n".join(f"<#{ch.id}> · [jump]({msg.jump_url})" for ch, msg in mentions[:10])[:1024]
+                    if mentions else "Not found in any open ticket or payout channel.", inline=False)
+    return embed
+
+
+async def lookup_amount(interaction, feed, usd: float, net: str | None) -> discord.Embed:
+    """The payout(s) of this amount, the wallet they went to, and that wallet's ticket."""
     shown = f"${usd:,.2f}"
-    embed = discord.Embed(title=f"Locate {shown}", colour=0x3B82F6)
-
-    feed = getattr(bot, "payout_feed", None)
-    if not feed or not feed.enabled or not feed.index_ready:
-        await interaction.followup.send("The payout index isn't ready yet, try again in a few minutes.",
-                                        ephemeral=True)
-        return
-
-    hits = feed.find_amount(usd)
+    embed = discord.Embed(title=f"Payout lookup {shown}", colour=0xEF4444)
+    hits = [h for h in feed.find_amount(usd) if net is None or h["chain"] == net]
     if not hits:
         embed.description = f"**NOT FOUND**\nNo payout of exactly {shown} has been sent on-chain."
     confirmed_tickets = []
     for h in hits[:5]:
-        wallets = h["to"] or []
         lines = [
             "**Status:** SENT · confirmed on the blockchain",
             f"**Date:** <t:{h['ts']}:f>",
             f"**Network:** {h['asset']} · {NETWORK_NAMES[h['chain']]}",
         ]
-        for w in wallets[:2]:
+        for w in (h["to"] or [])[:2]:
             lines.append(f"**Sent to:** `{w}`")
             mentions = await find_wallet_mentions(interaction.guild, w) if interaction.guild else []
             if mentions:
@@ -523,23 +515,19 @@ async def locate(interaction: discord.Interaction, amount: str):
 
     # Backup: tickets that mention the amount itself
     if interaction.guild:
-        plain = f"{usd:,.2f}".replace(",", "")
-        amount_mentions = []
-        for text in {f"{usd:,.2f}", plain}:
-            amount_mentions += await find_wallet_mentions(interaction.guild, text)
-        seen_ids, uniq = set(), []
-        for ch, msg in amount_mentions:
-            if ch.id not in seen_ids:
-                seen_ids.add(ch.id)
-                uniq.append((ch, msg))
-        if uniq:
+        found, seen_ids = [], set()
+        for text in {f"{usd:,.2f}", f"{usd:.2f}"}:
+            for ch, msg in await find_wallet_mentions(interaction.guild, text):
+                if ch.id not in seen_ids:
+                    seen_ids.add(ch.id)
+                    found.append((ch, msg))
+        if found:
             embed.add_field(name=f"Tickets mentioning {shown}",
-                            value="\n".join(f"<#{ch.id}> · [jump]({msg.jump_url})" for ch, msg in uniq[:8])[:1024],
+                            value="\n".join(f"<#{ch.id}> · [jump]({msg.jump_url})" for ch, msg in found[:8])[:1024],
                             inline=False)
-
-    embed.colour = 0x22C55E if hits else 0xEF4444
-    embed.set_footer(text="Closed (deleted) tickets can't be searched.")
-    await interaction.followup.send(embed=embed, ephemeral=True)
+    if hits:
+        embed.colour = 0x22C55E
+    return embed
 
 
 PERIODS = {"all": (None, "All time"), "1d": (1, "Last 24 hours"), "7d": (7, "Last 7 days"),
