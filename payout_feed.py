@@ -111,6 +111,8 @@ class PayoutFeed:
         self.ledger_ready = False
         self.sol_last_sig: str | None = None   # newest Solana signature already handled
         self.sol_start_ts: int = 0
+        self.sol_tx_version = 1                      # Solana transaction format (auto-upgrades)
+        self.sol_parsed: dict[str, list[dict]] = {}  # signature -> payouts found (cache for retries)
 
     @property
     def enabled(self) -> bool:
@@ -489,14 +491,34 @@ class PayoutFeed:
             log.info("Payout feed: Solana first scan, %d transaction(s) to check (this can take a few minutes)",
                      len(sigs))
         out = []
-        for s in reversed(sigs):  # oldest first
-            if s.get("err") is not None or s["signature"].lower() in self.seen:
+        for n, s in enumerate(reversed(sigs), 1):  # oldest first
+            sig_id = s["signature"]
+            if s.get("err") is not None or sig_id.lower() in self.seen:
                 continue
-            tx = await self.rpc("sol", "getTransaction", [s["signature"], {
-                "encoding": "jsonParsed", "maxSupportedTransactionVersion": 0, "commitment": "confirmed"}])
-            await asyncio.sleep(SOL_DELAY)
-            out += self._sol_parse(s, tx)
+            if sig_id not in self.sol_parsed:  # remember results so a retry doesn't redo work
+                tx = await self.sol_get_tx(sig_id)
+                await asyncio.sleep(SOL_DELAY)
+                self.sol_parsed[sig_id] = self._sol_parse(s, tx)
+            out += self.sol_parsed[sig_id]
+            if not self.sol_last_sig and n % 200 == 0:
+                log.info("Payout feed: Solana first scan %d/%d checked, %d payout(s) found so far",
+                         n, len(sigs), len(out))
         return out, newest
+
+    async def sol_get_tx(self, sig_id: str):
+        """Fetch one Solana transaction, upgrading the supported transaction version if the network asks."""
+        while True:
+            try:
+                return await self.rpc("sol", "getTransaction", [sig_id, {
+                    "encoding": "jsonParsed", "maxSupportedTransactionVersion": self.sol_tx_version,
+                    "commitment": "confirmed"}])
+            except RuntimeError as e:
+                m = re.search(r'maxSupportedTransactionVersion"?\s*:\s*(\d+)', str(e))
+                if m and int(m.group(1)) > self.sol_tx_version:
+                    self.sol_tx_version = int(m.group(1))
+                    log.info("Payout feed: Solana now using transaction version %d", self.sol_tx_version)
+                    continue
+                raise
 
     def _sol_parse(self, sig: dict, tx: dict | None) -> list[dict]:
         if not tx or not tx.get("meta") or tx["meta"].get("err") is not None:
