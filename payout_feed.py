@@ -388,16 +388,17 @@ class PayoutFeed:
                  f"{sum(v for v, _ in self.ledger.values()):,.2f}")
         return last_post
 
-    def lifetime(self) -> dict:
-        """Totals for /lifetime."""
-        values = list(self.ledger.values())
+    def lifetime(self, days: int | None = None) -> dict:
+        """Totals for /lifetime. days=None for all time, otherwise only the last N days."""
         now = datetime.now(timezone.utc).timestamp()
-        recent = [v for v, ts in values if ts >= now - 30 * 86400]
+        values = [(v, ts) for v, ts in self.ledger.values() if days is None or ts >= now - days * 86400]
+        count = len(values)
+        total = sum(v for v, _ in values)
         return {
-            "total": sum(v for v, _ in values),
-            "count": len(values),
+            "total": total,
+            "count": count,
             "largest": max((v for v, _ in values), default=0.0),
-            "last30": sum(recent),
+            "average": total / count if count else 0.0,
             "since": min((ts for _, ts in values), default=None),
         }
 
