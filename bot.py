@@ -10,6 +10,7 @@ CASHED ticket summariser bot.
 import json
 import logging
 import os
+from datetime import datetime, timezone
 
 import discord
 from anthropic import APIStatusError, AsyncAnthropic, BadRequestError
@@ -358,6 +359,34 @@ async def summarise(interaction: discord.Interaction, public: bool = False):
         await interaction.followup.send(embed=summary_embed)
         if solve_embed:
             await interaction.followup.send(embed=solve_embed, view=view, ephemeral=True)
+
+
+@bot.tree.command(name="lifetime", description="Total amount Cashed has paid out to traders (on-chain)")
+@app_commands.describe(private="Only show it to you (default: post it in the channel)")
+async def lifetime(interaction: discord.Interaction, private: bool = False):
+    feed = getattr(bot, "payout_feed", None)
+    if not feed or not feed.enabled:
+        await interaction.response.send_message("The payout feed isn't set up, so there are no totals yet.",
+                                                ephemeral=True)
+        return
+    if not feed.ledger_ready:
+        await interaction.response.send_message("Still loading payout history, try again in a minute.",
+                                                ephemeral=True)
+        return
+
+    s = feed.lifetime()
+    since = datetime.fromtimestamp(s["since"], tz=timezone.utc).strftime("%d %b %Y") if s["since"] else "-"
+    embed = discord.Embed(
+        description=f"# ${s['total']:,.2f}\nTotal paid out to traders\n{'━' * 30}",
+        colour=0x22C55E,
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.set_author(name="LIFETIME PAYOUTS", icon_url=bot.user.display_avatar.url)
+    embed.add_field(name="Payouts", value=f"`{s['count']:,}`", inline=True)
+    embed.add_field(name="Largest", value=f"`${s['largest']:,.2f}`", inline=True)
+    embed.add_field(name="Last 30 days", value=f"`${s['last30']:,.2f}`", inline=True)
+    embed.set_footer(text=f"Cashed  ·  Verified on-chain  ·  Since {since}")
+    await interaction.response.send_message(embed=embed, ephemeral=private)
 
 
 @bot.tree.command(name="payout", description="Grab the ticket name, wallet, network and amount for paying out")
