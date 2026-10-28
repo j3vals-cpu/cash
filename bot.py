@@ -266,6 +266,22 @@ class TicketBot(discord.Client):
 bot = TicketBot()
 
 
+@bot.tree.error
+async def on_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    """If any command crashes, tell the person why instead of 'The application did not respond'."""
+    original = getattr(error, "original", error)
+    log.exception("Command /%s failed", interaction.command.name if interaction.command else "?",
+                  exc_info=original)
+    text = f"Something went wrong running this command.\n-# {type(original).__name__}: {str(original)[:300]}"
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(text, ephemeral=True)
+        else:
+            await interaction.response.send_message(text, ephemeral=True)
+    except Exception:
+        pass
+
+
 def code(value: str) -> str:
     """Wrap a value so it's one-tap copyable in Discord."""
     value = (value or "Not provided").strip()
