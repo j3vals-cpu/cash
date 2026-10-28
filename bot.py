@@ -21,7 +21,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from payout_feed import PayoutFeed  # noqa: E402  (needs env loaded first)
+from payout_feed import PayoutFeed, PAYOUT_WALLET, SOLANA_WALLET  # noqa: E402  (needs env loaded first)
 
 DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
 GUILD_ID = os.getenv("GUILD_ID")  # set this so the command appears instantly
@@ -818,10 +818,10 @@ tracker = PayoutTracker()
 # /check: review every request, then delete the paid ones + mark the rest PENDING
 # --------------------------------------------------------------------------- #
 
-async def scan_requests():
-    """Read every request in the payout channels and match each one against the blockchain."""
+async def scan_requests(channel_ids):
+    """Read every request in the given payout channels and match each one against the blockchain."""
     reqs = []
-    for cid in (PAYOUT_CHANNEL_ID, LARGE_PAYOUT_CHANNEL_ID):
+    for cid in channel_ids:
         if not cid:
             continue
         ch = bot.get_channel(cid) or await bot.fetch_channel(cid)
@@ -885,6 +885,67 @@ def _chunks(title, lines, colour):
     return out
 
 
+EVM_ADDR_RE = re.compile(r"\b0x[a-fA-F0-9]{40}\b")
+SOL_ADDR_RE = re.compile(r"(?<![0-9A-Za-z])[1-9A-HJ-NP-Za-km-z]{32,44}(?![0-9A-Za-z])")
+OUR_WALLETS = {PAYOUT_WALLET.lower(), (SOLANA_WALLET or "").lower()}
+
+
+def wallets_in(text: str) -> list[str]:
+    found = EVM_ADDR_RE.findall(text or "")
+    for w in SOL_ADDR_RE.findall(text or ""):
+        if any(c.isdigit() for c in w) and any(c.isupper() for c in w) and any(c.islower() for c in w):
+            found.append(w)  # looks like a real Solana address, not a long word
+    return [w for w in found if w.lower() not in OUR_WALLETS]
+
+
+async def scan_tickets(guild: discord.Guild, skip_ticket_ids: set[int]):
+    """Open tickets: find the trader's wallet(s) and check if a payout has gone out since the ticket opened."""
+    channels = [c for c in guild.text_channels
+                if c.category and any(word in c.category.name.lower() for word in TICKET_CATEGORY_WORDS)
+                and c.id not in skip_ticket_ids]
+
+    async def one(ch):
+        wallets = []
+        try:
+            async for msg in ch.history(limit=FIND_SCAN_MESSAGES, oldest_first=True):
+                if msg.author.bot:
+                    continue
+                for w in wallets_in(msg.content):
+                    if w.lower() not in (x.lower() for x in wallets):
+                        wallets.append(w)
+        except (discord.Forbidden, discord.HTTPException):
+            return None
+        if not wallets:
+            return ("nowallet", ch, None, None)
+        opened = int(ch.created_at.timestamp())
+        best = None
+        for w in wallets:
+            hits = [h for h in bot.payout_feed.find(w) if h["ts"] >= opened - PAID_EARLY_WINDOW]
+            if hits and (best is None or hits[0]["ts"] > best[1]["ts"]):
+                best = (w, hits[0])  # newest payout to this wallet
+        if best:
+            return ("paid", ch, best[0], best[1])
+        return ("waiting", ch, wallets[-1], None)  # the latest wallet they posted
+
+    results = [r for r in await asyncio.gather(*(one(c) for c in channels)) if r]
+    order = lambda r: r[1].created_at
+    paid = sorted([r for r in results if r[0] == "paid"], key=order)
+    waiting = sorted([r for r in results if r[0] == "waiting"], key=order)
+    nowallet = sorted([r for r in results if r[0] == "nowallet"], key=order)
+    return paid, waiting, nowallet
+
+
+def _ticket_line(kind, ch, wallet, hit):
+    short = f"`{wallet[:6]}…{wallet[-4:]}`" if wallet else ""
+    if kind == "paid":
+        got = f"${hit['usd']:,.2f}" if hit["usd"] is not None else f"{hit['amount']:,.4f} {hit['asset']}"
+        return (f"<#{ch.id}> · paid **{got}** · <t:{hit['ts']}:d> · "
+                f"[tx](<{EXPLORERS[hit['chain']]}{hit['hash']}>) · {short}")
+    if kind == "waiting":
+        return f"<#{ch.id}> · {short} · opened <t:{int(ch.created_at.timestamp())}:R>"
+    return f"<#{ch.id}> · opened <t:{int(ch.created_at.timestamp())}:R>"
+
+
 class CheckConfirm(discord.ui.View):
     def __init__(self, user_id, paid, waiting):
         super().__init__(timeout=900)
@@ -936,8 +997,7 @@ class CheckConfirm(discord.ui.View):
         await interaction.response.edit_message(content="Cancelled. Nothing was changed.", view=self)
 
 
-@bot.tree.command(name="check", description="Review every payout request vs the blockchain, then clean up")
-async def check(interaction: discord.Interaction):
+async def run_check(interaction: discord.Interaction, include_tickets: bool):
     if STAFF_ROLE_IDS and not is_staff(interaction.user):
         await interaction.response.send_message("This command is for staff only.", ephemeral=True)
         return
@@ -947,7 +1007,9 @@ async def check(interaction: discord.Interaction):
                                                 ephemeral=True)
         return
     await interaction.response.defer(ephemeral=True, thinking=True)
-    paid, flagged, waiting = await scan_requests()
+    # /check = payouts-for-trio only; /checkall = both payout channels + every open ticket
+    ids = (PAYOUT_CHANNEL_ID, LARGE_PAYOUT_CHANNEL_ID) if include_tickets else (PAYOUT_CHANNEL_ID,)
+    paid, flagged, waiting = await scan_requests(ids)
 
     total = lambda items: sum((r["usd"] or 0) for r in items)
     embeds = []
@@ -959,8 +1021,28 @@ async def check(interaction: discord.Interaction):
     embeds += _chunks(f"STILL WAITING · {len(waiting)} · ${total(waiting):,.2f} (will be marked PENDING)",
                       [_req_line(r) for r in waiting] or ["None"], 0xEF4444)
 
-    summary = (f"**{len(paid)}** paid · **{len(flagged)}** to check · **{len(waiting)}** still waiting.\n"
-               f"Look through the list, then press **Confirm** to delete the paid posts and mark the rest PENDING.")
+    # /checkall: also open tickets that don't have a payout post yet
+    t_paid, t_waiting, t_nowallet = [], [], []
+    if include_tickets and interaction.guild:
+        covered = {r["ticket"] for r, _ in paid} | {r["ticket"] for r, _ in flagged} | {r["ticket"] for r in waiting}
+        t_paid, t_waiting, t_nowallet = await scan_tickets(interaction.guild, covered)
+    if t_paid:
+        embeds += _chunks(f"TICKETS · PAID · {len(t_paid)} (payout sent since the ticket opened - can be closed)",
+                          [_ticket_line(*r) for r in t_paid], 0x16A34A)
+    if t_waiting:
+        embeds += _chunks(f"TICKETS · WAITING · {len(t_waiting)} (wallet posted, nothing sent yet)",
+                          [_ticket_line(*r) for r in t_waiting], 0xDC2626)
+    if t_nowallet:
+        embeds += _chunks(f"TICKETS · NO WALLET · {len(t_nowallet)}",
+                          [_ticket_line(*r) for r in t_nowallet], 0x6B7280)
+
+    summary = f"**Payout posts:** {len(paid)} paid · {len(flagged)} to check · {len(waiting)} still waiting.\n"
+    if include_tickets:
+        summary += (f"**Open tickets:** {len(t_paid)} paid · {len(t_waiting)} waiting · "
+                    f"{len(t_nowallet)} no wallet yet.\n")
+    summary += "Press **Confirm** to delete the paid posts and mark the waiting posts PENDING."
+    if include_tickets:
+        summary += " Tickets are only listed, never changed."
     view = CheckConfirm(interaction.user.id, paid, waiting) if (paid or waiting) else None
     # Discord: max 10 embeds and ~6000 characters per message - split into as many messages as needed
     groups, cur, size = [], [], 0
@@ -974,6 +1056,16 @@ async def check(interaction: discord.Interaction):
     for g in groups[:-1]:
         await interaction.followup.send(embeds=g, ephemeral=True)
     await interaction.followup.send(summary, embeds=groups[-1], view=view or discord.utils.MISSING, ephemeral=True)
+
+
+@bot.tree.command(name="check", description="Check payouts-for-trio against the blockchain, then clean up")
+async def check(interaction: discord.Interaction):
+    await run_check(interaction, include_tickets=False)
+
+
+@bot.tree.command(name="checkall", description="Check both payout channels AND every open ticket against the blockchain")
+async def checkall(interaction: discord.Interaction):
+    await run_check(interaction, include_tickets=True)
 
 
 @bot.tree.command(name="pending", description="Payout requests that still need paying")
