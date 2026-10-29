@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import re
+import time
 from datetime import datetime, timedelta, timezone
 
 import discord
@@ -21,11 +22,13 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from payout_feed import PayoutFeed, PAYOUT_WALLET, SOLANA_WALLET  # noqa: E402  (needs env loaded first)
+from payout_feed import PayoutFeed, PAYOUT_WALLET, SOLANA_WALLET, DATA_DIR  # noqa: E402  (needs env loaded first)
 
 DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
 GUILD_ID = os.getenv("GUILD_ID")  # set this so the command appears instantly
-STAFF_ROLE_IDS = {int(x) for x in os.getenv("STAFF_ROLE_IDS", "").split(",") if x.strip()}
+# Staff roles: these roles OR any role ranked above them can use the bot
+STAFF_ROLE_IDS = {int(x) for x in os.getenv("STAFF_ROLE_IDS", "1351115065910362223,1559584975756464138,1559897057693663232").split(",")
+                  if x.strip()}
 MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-5-5")
 MAX_MESSAGES = int(os.getenv("MAX_MESSAGES", "300"))
 MAX_IMAGES = int(os.getenv("MAX_IMAGES", "5"))
@@ -132,8 +135,19 @@ TICKET_TOOL = {
 
 
 def is_staff(member: discord.abc.User) -> bool:
+    """Has one of the staff roles, a role ranked above the lowest of them, or is an admin."""
     roles = getattr(member, "roles", [])
-    return any(r.id in STAFF_ROLE_IDS for r in roles)
+    if any(r.id in STAFF_ROLE_IDS for r in roles):
+        return True
+    perms = getattr(member, "guild_permissions", None)
+    if perms is not None and perms.administrator:
+        return True
+    guild = getattr(member, "guild", None)
+    staff_roles = [guild.get_role(rid) for rid in STAFF_ROLE_IDS] if guild else []
+    staff_roles = [r for r in staff_roles if r is not None]
+    if staff_roles and getattr(member, "top_role", None) is not None:
+        return member.top_role.position >= min(r.position for r in staff_roles)
+    return False
 
 
 def format_message(msg: discord.Message) -> str:
@@ -254,6 +268,11 @@ class TicketBot(discord.Client):
         self.tree = app_commands.CommandTree(self)
 
     async def setup_hook(self):
+        # Hide every command from normal members. Admins see them; the server owner then lets the
+        # staff roles see them in Server Settings -> Integrations -> Cashed Bot (Discord doesn't let bots do that part).
+        for cmd in self.tree.get_commands():
+            cmd.default_permissions = discord.Permissions(administrator=True)
+            cmd.guild_only = True
         if GUILD_ID:
             guild = discord.Object(id=int(GUILD_ID))
             self.tree.copy_global_to(guild=guild)
@@ -266,6 +285,7 @@ class TicketBot(discord.Client):
         self.loop.create_task(self.payout_feed.run())
         self.loop.create_task(tracker.run())
         self.loop.create_task(daily_reset_loop())
+        self.loop.create_task(rebuild_risk_from_category())
         # Public API for the website's live payout feed (needs Railway public networking)
         import web_api
         self.loop.create_task(web_api.start(self.payout_feed))
@@ -474,6 +494,12 @@ async def find(interaction: discord.Interaction, search: str, network: app_comma
                 lines.append(f"<#{led['ticket']}> · **{led['status']}** · paid {_money(led['paid_total'])}"
                              + (f" · {led['note']}" if led.get("note") else ""))
         embed.add_field(name="Ticket status", value="\n".join(lines)[:1024], inline=False)
+    flagged_wallets = [] if AMOUNT_RE.match(search) else [search]
+    for led in ledgers:
+        flagged_wallets += led["wallets"]
+    warn = risk_note(flagged_wallets, next((c for c in chans if risk.ticket_flagged(c)), None))
+    if warn:
+        embed.insert_field_at(0, name="RISK FLAG", value=warn[:1024], inline=False)
     paid_ready = [l for l in ledgers if l["status"] == "PAID"]
     embed.set_footer(text="Closed (deleted) tickets can't be searched.")
     content = ("**This trader has been paid in full.** Close the ticket?" if paid_ready else None)
@@ -579,6 +605,9 @@ PERIODS = {"all": (None, "All time"), "1d": (1, "Last 24 hours"), "7d": (7, "Las
 ])
 async def lifetime(interaction: discord.Interaction, period: app_commands.Choice[str] = None,
                    private: bool = False):
+    if STAFF_ROLE_IDS and not is_staff(interaction.user):
+        await interaction.response.send_message("This command is for staff only.", ephemeral=True)
+        return
     feed = getattr(bot, "payout_feed", None)
     if not feed or not feed.enabled:
         await interaction.response.send_message("The payout feed isn't set up, so there are no totals yet.",
@@ -658,6 +687,10 @@ async def payout(interaction: discord.Interaction):
     if note:
         embed.add_field(name="Check", value=note[:1024], inline=False)
     embed.set_footer(text="AI-extracted: check the address against the user's message before sending.")
+    warn = risk_note([wallet], channel)
+    if warn:
+        embed.colour = 0xDC2626
+        embed.insert_field_at(0, name="RISK FLAG", value=warn[:1024], inline=False)
 
     # Auto-post the line into the payout channel (if one is set)
     posted_to = None
@@ -695,7 +728,8 @@ async def payout(interaction: discord.Interaction):
                 # Clean labelled layout - checks/notes stay in the private card only
                 opened_ts = int(channel.created_at.timestamp())
                 text = (f"### PENDING · Payout · <#{channel.id}>\n"
-                        f"**Ticket opened:** <t:{opened_ts}:f> (<t:{opened_ts}:R>)\n"
+                        + ("**Risk:** flagged for review - do not pay without risk team sign-off\n" if warn else "")
+                        + f"**Ticket opened:** <t:{opened_ts}:f> (<t:{opened_ts}:R>)\n"
                         f"**User:** {username}\n"
                         f"**Email:** {email}\n"
                         f"**Amount:** {amount}\n"
@@ -1154,6 +1188,8 @@ def _txs(payouts, n=4):
 
 def ledger_line(led: dict) -> str:
     line = f"<#{led['ticket']}>"
+    if risk.flags_for(led["wallets"]) or risk.ticket_flagged(led.get("channel")):
+        line = "**[RISK]** " + line
     if led.get("user"):
         line += f" · {led['user']}"
     if led["requested"]:
@@ -1597,6 +1633,185 @@ class FindCloseView(discord.ui.View):
             await interaction.response.defer(ephemeral=True, thinking=True)
             await start_paid(interaction, ch)
         return cb
+
+
+# --------------------------------------------------------------------------- #
+# Risk team: /hedge quietly moves a ticket to the risk category and flags the wallet(s)
+# --------------------------------------------------------------------------- #
+
+HEDGE_CATEGORY_ID = int(os.getenv("HEDGE_CATEGORY_ID", "1565457874392588399") or 0)
+HEDGE_LOG_CHANNEL_ID = int(os.getenv("HEDGE_LOG_CHANNEL_ID", "1565491637059322038") or 0)
+RISK_FILE = os.path.join(DATA_DIR, "risk.json")
+
+
+class RiskStore:
+    """Flagged wallets and tickets. Saved to /data if the Railway volume exists; rebuilt from the
+    risk category on startup otherwise."""
+
+    def __init__(self):
+        self.wallets: dict[str, dict] = {}   # wallet (lowercase) -> info
+        self.tickets: dict[str, dict] = {}   # ticket id (str) -> info incl. original category
+        try:
+            with open(RISK_FILE, encoding="utf-8") as f:
+                d = json.load(f)
+            self.wallets, self.tickets = d.get("wallets", {}), d.get("tickets", {})
+        except FileNotFoundError:
+            pass
+        except Exception:
+            log.exception("Couldn't read risk file")
+
+    def save(self):
+        try:
+            os.makedirs(DATA_DIR, exist_ok=True)
+            tmp = RISK_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"wallets": self.wallets, "tickets": self.tickets}, f)
+            os.replace(tmp, RISK_FILE)
+        except Exception:
+            log.exception("Couldn't save risk file")
+
+    def flag(self, wallets, info):
+        for w in wallets:
+            self.wallets[w.lower()] = {**info, "wallet": w}
+
+    def unflag(self, wallets):
+        for w in wallets:
+            self.wallets.pop(w.lower(), None)
+
+    def flags_for(self, wallets) -> list[dict]:
+        return [self.wallets[w.lower()] for w in wallets if w and w.lower() in self.wallets]
+
+    def ticket_flagged(self, ch) -> bool:
+        return ch is not None and (getattr(ch, "category_id", None) == HEDGE_CATEGORY_ID
+                                   or str(ch.id) in self.tickets)
+
+
+risk = RiskStore()
+
+
+def risk_note(wallets=(), ch=None) -> str | None:
+    """Short private warning for staff, or None if nothing is flagged."""
+    flags = risk.flags_for(wallets)
+    if flags:
+        f = flags[0]
+        why = f" - {f['reason']}" if f.get("reason") else ""
+        return f"Wallet flagged by the risk team{why} (<t:{f.get('ts', 0)}:d>). Don't pay without risk team sign-off."
+    if risk.ticket_flagged(ch):
+        return "This ticket is under risk review. Don't pay without risk team sign-off."
+    return None
+
+
+async def rebuild_risk_from_category():
+    """If the saved flags were lost (no volume), re-flag wallets in tickets sitting in the risk category."""
+    await bot.wait_until_ready()
+    cat = bot.get_channel(HEDGE_CATEGORY_ID)
+    if cat is None:
+        return
+    added = 0
+    for ch in getattr(cat, "text_channels", []):
+        if str(ch.id) not in risk.tickets:
+            risk.tickets[str(ch.id)] = {"name": ch.name, "reason": "in risk category", "ts": int(time.time())}
+        info = await read_ticket_for_ledger(ch, use_ai=False)
+        new = [w for w in info["wallets"] if w.lower() not in risk.wallets]
+        if new:
+            risk.flag(new, {"reason": "in risk category", "ticket": ch.id, "ts": int(time.time())})
+            added += len(new)
+    if added:
+        risk.save()
+    log.info("Risk: %d wallet(s) flagged, %d ticket(s) under review", len(risk.wallets), len(risk.tickets))
+
+
+async def risk_log(embed):
+    if not HEDGE_LOG_CHANNEL_ID:
+        return
+    try:
+        ch = bot.get_channel(HEDGE_LOG_CHANNEL_ID) or await bot.fetch_channel(HEDGE_LOG_CHANNEL_ID)
+        await ch.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+    except Exception:
+        log.exception("Couldn't write to the risk log channel")
+
+
+@bot.tree.command(name="hedge", description="Quietly flag this trader for the risk team (they won't see anything)")
+@app_commands.describe(reason="Why you suspect them (only staff see this)")
+async def hedge(interaction: discord.Interaction, reason: str = ""):
+    if STAFF_ROLE_IDS and not is_staff(interaction.user):
+        await interaction.response.send_message("This command is for staff only.", ephemeral=True)
+        return
+    ch = interaction.channel
+    if not is_ticket_channel(ch):
+        await interaction.response.send_message("Run /hedge inside the trader's ticket.", ephemeral=True)
+        return
+    cat = interaction.guild.get_channel(HEDGE_CATEGORY_ID) if interaction.guild else None
+    if cat is None:
+        await interaction.response.send_message("I can't find the risk category - check `HEDGE_CATEGORY_ID`.",
+                                                ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    info = await read_ticket_for_ledger(ch, use_ai=False)
+    wallets = list(dict.fromkeys(info["wallets"] + [p["wallet"] for p in tracker.by_ticket().get(ch.id, [])]))
+    now = int(time.time())
+    entry = {"reason": reason, "by": interaction.user.id, "ts": now, "ticket": ch.id, "name": ch.name}
+    risk.flag(wallets, entry)
+
+    moved = ch.category_id != HEDGE_CATEGORY_ID
+    if moved:
+        risk.tickets[str(ch.id)] = {**entry, "orig_category": ch.category_id}
+        try:
+            # keep the ticket's own permissions so the trader notices nothing
+            await ch.edit(category=cat, sync_permissions=False, reason="Risk review")
+        except Exception as e:
+            risk.save()
+            await interaction.followup.send(f"Flagged the wallet(s), but couldn't move the ticket: {e}",
+                                            ephemeral=True)
+            return
+    risk.save()
+
+    e = discord.Embed(title=f"HEDGE FLAG · #{ch.name}", colour=0xDC2626, timestamp=datetime.now(timezone.utc))
+    e.add_field(name="Ticket", value=f"<#{ch.id}>", inline=True)
+    e.add_field(name="Flagged by", value=interaction.user.mention, inline=True)
+    e.add_field(name="Reason", value=reason or "not given", inline=False)
+    e.add_field(name="Wallets", value="\n".join(f"`{w}`" for w in wallets[:10]) or "none posted yet", inline=False)
+    await risk_log(e)
+
+    text = (f"Flagged quietly. {'Moved the ticket to the risk category. ' if moved else 'Ticket was already in the risk category. '}"
+            f"{len(wallets)} wallet(s) flagged - staff will see a warning on /payout, /find and /check for them.\n"
+            f"The trader sees no change. Use **/unhedge** to undo.")
+    if not wallets:
+        text += "\nNo wallet in the ticket yet - run /hedge again once they post one."
+    await interaction.followup.send(text, ephemeral=True)
+
+
+@bot.tree.command(name="unhedge", description="Remove the risk flag and move the ticket back")
+async def unhedge(interaction: discord.Interaction):
+    if STAFF_ROLE_IDS and not is_staff(interaction.user):
+        await interaction.response.send_message("This command is for staff only.", ephemeral=True)
+        return
+    ch = interaction.channel
+    if not is_ticket_channel(ch):
+        await interaction.response.send_message("Run /unhedge inside the ticket.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    t = risk.tickets.pop(str(ch.id), {})
+    info = await read_ticket_for_ledger(ch, use_ai=False)
+    wallets = list(dict.fromkeys(info["wallets"] + [p["wallet"] for p in tracker.by_ticket().get(ch.id, [])]))
+    risk.unflag(wallets)
+    risk.save()
+    back = None
+    if ch.category_id == HEDGE_CATEGORY_ID and interaction.guild:
+        back = interaction.guild.get_channel(t.get("orig_category") or 0)
+        if back is None:  # original unknown: the other category with the same name
+            back = next((c for c in interaction.guild.categories
+                         if c.id != HEDGE_CATEGORY_ID and c.name == ch.category.name), None)
+        if back is not None:
+            await ch.edit(category=back, sync_permissions=False, reason="Risk review cleared")
+    e = discord.Embed(title=f"HEDGE CLEARED · #{ch.name}", colour=0x16A34A, timestamp=datetime.now(timezone.utc))
+    e.add_field(name="Cleared by", value=interaction.user.mention, inline=True)
+    await risk_log(e)
+    await interaction.followup.send(
+        f"Risk flag removed from {len(wallets)} wallet(s)." +
+        (f" Moved back to **{back.name}**." if back else " (Couldn't work out the original category - move it manually.)"
+         if ch.category_id == HEDGE_CATEGORY_ID else ""), ephemeral=True)
 
 
 @bot.event
