@@ -259,7 +259,7 @@ async def extract(transcript: str, image_urls: list[str], tool: dict = None, sys
 
 intents = discord.Intents.default()
 intents.message_content = True  # must also be enabled in the Developer Portal
-intents.members = bool(STAFF_ROLE_IDS)  # lets the bot tell staff and users apart
+intents.members = False  # not needed: Discord sends each user's roles with every command and button click
 
 
 class TicketBot(discord.Client):
