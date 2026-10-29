@@ -775,6 +775,9 @@ STATUS_LINE_PREFIXES = ("**Paid:**", "**Paid so far:**", "**Note:**", "**Still o
 PAID_EARLY_WINDOW = 24 * 3600          # small buffer before the ticket opened
 TICKET_GONE_LOOKBACK = 14 * 24 * 3600  # if the ticket is deleted, look back 14 days from the post
 PAID_CLOSE_CHANNEL_ID = int(os.getenv("PAID_CLOSE_CHANNEL_ID", "0") or 0)
+# /checkall only scans open tickets whose name starts with one of these (e.g. payout-xxx)
+CHECKALL_TICKET_PREFIXES = tuple(x.strip().lower() for x in
+                                 os.getenv("CHECKALL_TICKET_PREFIXES", "payout-").split(",") if x.strip())
 # Daily reset: clear unpaid requests so the channel starts fresh each day (PAID ones are kept for closing)
 DAILY_RESET_HOUR = int(os.getenv("DAILY_RESET_HOUR", "0"))  # hour of the day, UK time
 DAILY_RESET_STATUSES = {x.strip().upper() for x in
@@ -1284,7 +1287,9 @@ async def run_check(interaction: discord.Interaction, include_tickets: bool, sta
 
     if include_tickets and interaction.guild:  # open tickets with no /payout post yet
         covered = {l["ticket"] for l in ledgers} | set(tracker.by_ticket().keys())
-        chans = [c for c in interaction.guild.text_channels if is_ticket_channel(c) and c.id not in covered]
+        chans = [c for c in interaction.guild.text_channels
+                 if is_ticket_channel(c) and c.id not in covered
+                 and c.name.lower().startswith(CHECKALL_TICKET_PREFIXES)]
         ledgers += await asyncio.gather(*(ledger_for_channel(c) for c in chans))
 
     for led in ledgers:  # keep the posts' status lines in sync while we're here
@@ -1318,7 +1323,7 @@ async def run_check(interaction: discord.Interaction, include_tickets: bool, sta
         embeds += _chunks(f"BROKEN POSTS · {len(broken)} (/payout run outside a ticket)",
                           [f"{_money(p['usd'] or 0)} · [post]({p['msg'].jump_url})" for p in broken], 0x9CA3AF)
 
-    where = "payouts-for-trio + payouts-for-sam + open tickets" if include_tickets else "payouts-for-trio"
+    where = "payouts-for-trio + payouts-for-sam + open payout tickets" if include_tickets else "payouts-for-trio"
     owed_total = sum(l["owed"] for l in counts["PARTLY PAID"]) + sum(l["requested_total"] for l in counts["PENDING"])
     text = (f"**{where}** · {len(counts['PAID'])} paid · {len(counts['PARTLY PAID'])} partly paid · "
             f"{len(counts['PENDING'])} pending · {len(counts['CHECK'])} to check"
