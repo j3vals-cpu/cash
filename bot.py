@@ -264,6 +264,9 @@ class TicketBot(discord.Client):
         self.payout_feed = PayoutFeed(self)
         self.loop.create_task(self.payout_feed.run())
         self.loop.create_task(tracker.run())
+        # Public API for the website's live payout feed (needs Railway public networking)
+        import web_api
+        self.loop.create_task(web_api.start(self.payout_feed))
 
 
 bot = TicketBot()
