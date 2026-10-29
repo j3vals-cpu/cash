@@ -808,7 +808,7 @@ REQ_USER_RE = re.compile(r"\*\*User:\*\*\s*([^\n]+)")
 STATUS_LINE_PREFIXES = ("**Paid:**", "**Paid so far:**", "**Note:**", "**Still owed:**", "**Status:**")
 PAID_EARLY_WINDOW = 24 * 3600          # small buffer before the ticket opened
 TICKET_GONE_LOOKBACK = 14 * 24 * 3600  # if the ticket is deleted, look back 14 days from the post
-PAID_CLOSE_CHANNEL_ID = int(os.getenv("PAID_CLOSE_CHANNEL_ID", "0") or 0)
+PAID_CLOSE_CHANNEL_ID = int(os.getenv("PAID_CLOSE_CHANNEL_ID", "1565459154343174274") or 0)
 # /checkall only scans open tickets whose name starts with one of these (e.g. payout-xxx)
 CHECKALL_TICKET_PREFIXES = tuple(x.strip().lower() for x in
                                  os.getenv("CHECKALL_TICKET_PREFIXES", "payout-").split(",") if x.strip())
