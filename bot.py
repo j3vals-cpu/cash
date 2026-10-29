@@ -889,6 +889,40 @@ def settle(requested: list[float], payouts: list[dict]):
     return matched, outstanding, left
 
 
+class MarkedPaidStore:
+    """Tickets staff marked paid with the Done button (kept so they stay PAID even before the
+    payment shows on-chain, or if it was sent from another wallet)."""
+
+    FILE = os.path.join(DATA_DIR, "marked_paid.json")
+
+    def __init__(self):
+        self.tickets: dict[str, dict] = {}
+        try:
+            with open(self.FILE, encoding="utf-8") as f:
+                self.tickets = json.load(f)
+        except FileNotFoundError:
+            pass
+        except Exception:
+            log.exception("Couldn't read marked-paid file")
+
+    def mark(self, ticket_id: int, usd, by):
+        self.tickets[str(ticket_id)] = {"ts": int(time.time()), "usd": usd, "by": str(by)}
+        try:
+            os.makedirs(DATA_DIR, exist_ok=True)
+            tmp = self.FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self.tickets, f)
+            os.replace(tmp, self.FILE)
+        except Exception:
+            log.exception("Couldn't save marked-paid file")
+
+    def get(self, ticket_id: int):
+        return self.tickets.get(str(ticket_id))
+
+
+marked_paid = MarkedPaidStore()
+
+
 def build_ledger(ticket_id: int, posts: list[dict], wallets=(), requested=None, opened=None,
                  name=None, user=None, note="") -> dict:
     """Everything one ticket asked for vs everything paid to its wallet(s) since it opened."""
@@ -943,6 +977,12 @@ def build_ledger(ticket_id: int, posts: list[dict], wallets=(), requested=None, 
         status = "PENDING"
     if status == "PAID" and paid_total > requested_total + max(1.0, requested_total * 0.01):
         note = note or f"paid {_money(paid_total)}, more than the {_money(requested_total)} requested"
+
+    # Marked paid by staff (Done button) after the latest request -> treat as paid
+    mark = marked_paid.get(ticket_id)
+    if mark and status != "PAID" and mark["ts"] >= max((p["created"] for p in posts), default=0):
+        status, owed = "PAID", 0.0
+        note = f"marked paid by {mark['by']} - not seen on-chain yet"
 
     if not user:
         user = next((p.get("user") for p in posts if p.get("user")), None)
@@ -1272,11 +1312,11 @@ def find_junk(channel_ids):
 
 
 STATUS_CODES = {"PENDING": "pg", "PARTLY PAID": "pl", "CHECK": "ck", "NO WALLET": "nw", "PAID": "pd"}
-STATUS_CODE_RE = re.compile(r"^(?:pg|pl|ck|nw|pd)-")
+STATUS_CODE_RE = re.compile(r"^(?:(?:pg|pl|ck|nw|pd)-|paid-\d{4}-)")
 
 
 def base_name(name: str) -> str:
-    """Ticket name without our status code (pg-/pl-/ck-/nw-/pd-)."""
+    """Ticket name without our status code (pg-/pl-/ck-/nw-/pd-/paid-HHMM-)."""
     return STATUS_CODE_RE.sub("", name or "")
 
 
@@ -1289,10 +1329,16 @@ def status_name(name: str, status: str) -> str:
 class CheckActionsView(discord.ui.View):
     """Buttons under /check and /checkall: rename tickets by status, delete duplicate/broken posts."""
 
-    def __init__(self, user_id, junk, ledgers):
+    def __init__(self, user_id, junk, ledgers, payable=(), on_hold=()):
         super().__init__(timeout=900)
         self.user_id, self.junk = user_id, list(junk)
         self.ledgers = [l for l in ledgers if is_ticket_channel(l.get("channel"))]
+        self.payable, self.on_hold = list(payable), list(on_hold)
+        if self.payable:
+            b = discord.ui.Button(label=f"Pay out · grab wallets ({len(self.payable)})",
+                                  style=discord.ButtonStyle.success)
+            b.callback = self.pay_out
+            self.add_item(b)
         if self.ledgers:
             b = discord.ui.Button(label="Rename tickets by status (pg / pl / ck / nw / pd)",
                                   style=discord.ButtonStyle.primary)
@@ -1316,13 +1362,21 @@ class CheckActionsView(discord.ui.View):
                 item.disabled = True
         await interaction.response.edit_message(view=self)
 
+    async def pay_out(self, interaction: discord.Interaction):
+        items = [pay_item(l) for l in self.payable]
+        total = sum(i["amount"] or 0 for i in items)
+        hold = f"\n{len(self.on_hold)} risk ticket(s) are left out - they're on hold." if self.on_hold else ""
+        await interaction.response.send_message(
+            f"**{len(items)} ticket(s) to pay · {_money(total)}**{hold}\nHow do you want to go through them?",
+            view=PayModeView(self.user_id, items, self.on_hold), ephemeral=True)
+
     async def rename(self, interaction: discord.Interaction):
         await self._lock(interaction, "Rename tickets by status (pg / pl / ck / nw / pd)")
         done = same = failed = 0
         for led in self.ledgers:
             ch = led["channel"]
             new = status_name(ch.name, led["status"])
-            if new == ch.name:
+            if new == ch.name or (led["status"] == "PAID" and ch.name.startswith("paid-")):
                 same += 1
                 continue
             try:
@@ -1352,6 +1406,343 @@ class CheckActionsView(discord.ui.View):
             await asyncio.sleep(0.5)
         await interaction.followup.send(f"Deleted **{done}** post(s)." + (f" {failed} failed." if failed else ""),
                                         ephemeral=True)
+
+
+# --------------------------------------------------------------------------- #
+# Pay out: go through every ticket that needs paying, one by one or in bulk
+# --------------------------------------------------------------------------- #
+
+REQ_EMAIL_RE = re.compile(r"\*\*Email:\*\*\s*([^\n]+)")
+REQ_NETWORK_RE = re.compile(r"\*\*Network:\*\*\s*([^\n]+)")
+
+
+def is_risky(led) -> bool:
+    return bool(risk.flags_for(led["wallets"]) or risk.ticket_flagged(led.get("channel")))
+
+
+def owed_of(led) -> float:
+    if led["status"] == "PARTLY PAID":
+        return led["owed"]
+    if led["status"] in ("PENDING", "NO WALLET"):
+        return led["requested_total"]
+    return 0.0
+
+
+def guess_network(wallet: str) -> str:
+    return "BNB Chain / Ethereum (check ticket)" if wallet.lower().startswith("0x") else "Solana"
+
+
+def pay_item(led) -> dict:
+    """Everything needed to send one payout: who, how much, where."""
+    post = max(led["posts"], key=lambda p: p["created"]) if led["posts"] else None
+    content = post["msg"].content if post else ""
+
+    def grab(rx):
+        m = rx.search(content)
+        v = m.group(1).strip() if m else None
+        return None if not v or v == "Not provided" else v
+
+    wallet = post["wallet"] if post else led["wallets"][-1]  # newest wallet they posted
+    owed = owed_of(led)
+    return {
+        "led": led, "ticket": led["ticket"], "name": led["name"] or str(led["ticket"]),
+        "user": grab(REQ_USER_RE) or led.get("user"), "email": grab(REQ_EMAIL_RE),
+        "network": grab(REQ_NETWORK_RE), "wallet": wallet, "amount": owed or None,
+        "other_wallets": [w for w in led["wallets"] if w.lower() != wallet.lower()],
+        "from_post": bool(post), "done": False, "skipped": False,
+    }
+
+
+async def fill_from_ticket(item):
+    """No /payout post: read the ticket with AI for user, email, network (and amount if missing)."""
+    if item["from_post"] or item.get("filled"):
+        return
+    item["filled"] = True
+    ch = bot.get_channel(item["ticket"])
+    if ch is None:
+        return
+    try:
+        msgs = [m async for m in ch.history(limit=MAX_MESSAGES)]
+        msgs.reverse()
+        transcript = "\n".join(format_message(m) for m in msgs if m.content or m.embeds or m.attachments)
+        images = [a.url for m in reversed(msgs) if not m.author.bot for a in m.attachments
+                  if (a.content_type or "").startswith("image/")][:MAX_IMAGES]
+        async with AI_TICKET_LIMIT:
+            data = await extract(transcript, images, tool=PAYOUT_TOOL, system=PAYOUT_PROMPT)
+    except Exception:
+        log.exception("Pay out: couldn't read #%s", getattr(ch, "name", item["ticket"]))
+        return
+
+    def val(k):
+        v = (data.get(k) or "").strip().replace("`", "")
+        return None if not v or v == "Not provided" else v
+
+    item["user"] = item["user"] or val("cashed_username")
+    item["email"] = val("cashed_email")
+    item["network"] = val("crypto_network")
+    ai_wallet = val("crypto_wallet")
+    # only switch wallet if the AI's pick is one the trader actually typed (never trust a made-up one)
+    if ai_wallet and ai_wallet.lower() in (w.lower() for w in item["led"]["wallets"]):
+        if ai_wallet.lower() != item["wallet"].lower():
+            item["other_wallets"] = [w for w in item["led"]["wallets"] if w.lower() != ai_wallet.lower()]
+        item["wallet"] = next(w for w in item["led"]["wallets"] if w.lower() == ai_wallet.lower())
+    if not item["amount"] and val("payout_amount_usd"):
+        item["amount"] = usd_amount(val("payout_amount_usd"))
+        item["amount_from_ai"] = True
+
+
+def pay_card(item, pos, total) -> discord.Embed:
+    led = item["led"]
+    amount = _money(item["amount"]) if item["amount"] else "Not stated - check the ticket"
+    lines = [f"<#{item['ticket']}>",
+             f"**User:** {item['user'] or 'Not provided'}",
+             f"**Email:** {item['email'] or 'Not provided'}",
+             f"**Network:** {item['network'] or guess_network(item['wallet'])}",
+             f"**Amount to send:** {amount}"]
+    if led["status"] == "PARTLY PAID":
+        lines.append(f"-# {_money(led['paid_total'])} already sent of {_money(led['requested_total'])} requested")
+    elif item.get("amount_from_ai"):
+        lines.append("-# amount read from the ticket - double-check it")
+    opened = led.get("opened")
+    if opened:
+        lines.append(f"**Ticket opened:** <t:{opened}:f> (<t:{opened}:R>)")
+    lines += ["**Wallet:**", f"```\n{item['wallet']}\n```"]
+    if item["other_wallets"]:
+        lines.append("-# Other wallet(s) in this ticket: " + ", ".join(f"`{w}`" for w in item["other_wallets"][:3]))
+    if led.get("note"):
+        lines.append(f"-# Note: {led['note']}")
+    e = discord.Embed(title=f"{pos} of {total} · {led['status']} · #{item['name']}",
+                      description="\n".join(lines)[:4000],
+                      colour=0xF59E0B if led["status"] == "PARTLY PAID" else 0xDC2626)
+    e.set_footer(text="Send the payment, then press Done. Check the wallet against the trader's message first.")
+    return e
+
+
+def uk_now() -> datetime:
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo("Europe/London"))
+    except Exception:
+        return datetime.now(timezone.utc)
+
+
+async def mark_ticket_paid(item, staff) -> str:
+    """Done: remember it's paid, rename the ticket paid-HHMM-..., tell the trader, update the payout post."""
+    now = uk_now()
+    ts = int(now.timestamp())
+    marked_paid.mark(item["ticket"], item["amount"], getattr(staff, "display_name", staff))
+    item["done"], item["skipped"] = True, False
+    result = []
+    ch = bot.get_channel(item["ticket"])
+    if ch is None:
+        return "ticket no longer exists - marked paid only"
+    amount = f"**{_money(item['amount'])}**" if item["amount"] else "your payout"
+    tail = item["wallet"][-4:]
+    try:
+        await ch.send(f"You have been paid {amount} at <t:{ts}:f> (sent to your wallet ending `{tail}`).\n"
+                      f"Thanks for trading with Cashed.", allowed_mentions=discord.AllowedMentions.none())
+        result.append("trader messaged")
+    except Exception:
+        result.append("couldn't message the ticket")
+    new = f"paid-{now:%H%M}-{base_name(ch.name)}"[:100]
+    try:
+        await asyncio.wait_for(ch.edit(name=new, reason=f"Marked paid by {staff}"), timeout=8)
+        result.append(f"renamed to #{new}")
+    except Exception:
+        result.append("not renamed (Discord rename limit - try the Rename button later)")
+    # flip its payout post(s) to PAID
+    posts = tracker.by_ticket().get(item["ticket"], [])
+    if posts:
+        led = build_ledger(item["ticket"], posts, wallets=item["led"]["wallets"])
+        for p in posts:
+            try:
+                await tracker.update_post(p, led)
+            except Exception:
+                pass
+    return " · ".join(result)
+
+
+class _OwnerView(discord.ui.View):
+    def __init__(self, user_id, timeout=1800):
+        super().__init__(timeout=timeout)
+        self.user_id = user_id
+
+    async def interaction_check(self, interaction):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("Only the person who ran the command can use this.",
+                                                    ephemeral=True)
+            return False
+        return True
+
+
+class PayModeView(_OwnerView):
+    def __init__(self, user_id, items, on_hold):
+        super().__init__(user_id)
+        self.items, self.on_hold = items, on_hold
+
+    @discord.ui.button(label="One by one", style=discord.ButtonStyle.success)
+    async def one(self, interaction: discord.Interaction, button):
+        await interaction.response.defer()
+        q = PayQueueView(self.user_id, self.items)
+        await q.show(interaction)
+
+    @discord.ui.button(label="Bulk view", style=discord.ButtonStyle.primary)
+    async def bulk(self, interaction: discord.Interaction, button):
+        await interaction.response.edit_message(content="Bulk view below.", view=None)
+        await send_bulk(interaction, self.items, self.on_hold)
+
+
+class PayQueueView(_OwnerView):
+    """One ticket at a time: copy the wallet + amount, pay, press Done, next one appears."""
+
+    def __init__(self, user_id, items):
+        super().__init__(user_id)
+        self.items, self.i, self.last = items, 0, ""
+
+    def _prefetch(self, i):
+        if 0 <= i < len(self.items):
+            it = self.items[i]
+            if "task" not in it:
+                it["task"] = asyncio.create_task(fill_from_ticket(it))
+            return it["task"]
+
+    def _already_paid(self, item) -> bool:
+        """Re-check right before showing it, so nobody pays a ticket twice."""
+        if item["done"]:
+            return False
+        posts = tracker.by_ticket().get(item["ticket"], [])
+        fresh = build_ledger(item["ticket"], posts, wallets=item["led"]["wallets"],
+                             requested=None if posts else item["led"]["requested"])
+        return fresh["status"] == "PAID"
+
+    async def show(self, interaction):
+        while self.i < len(self.items) and self._already_paid(self.items[self.i]):
+            self.last = f"#{self.items[self.i]['name']} is already paid - skipped it"
+            self.items[self.i].update(done=True, already=True)
+            self.i += 1
+        if self.i >= len(self.items):
+            return await self.finish(interaction)
+        await self._prefetch(self.i)
+        self._prefetch(self.i + 1)  # read the next ticket in the background
+        item = self.items[self.i]
+        self.back.disabled = self.i == 0
+        self.done.disabled = item["done"]  # never message a trader twice
+        self.copy_amount.disabled = not item["amount"]
+        content = (f"-# Last: {self.last}" if self.last else None)
+        await interaction.edit_original_response(content=content, embed=pay_card(item, self.i + 1, len(self.items)),
+                                                 view=self)
+
+    async def finish(self, interaction):
+        done = [it for it in self.items if it["done"] and not it.get("already")]
+        skipped = [it for it in self.items if not it["done"]]
+        lines = [f"**Finished.** Marked **{len(done)}** paid · {_money(sum(it['amount'] or 0 for it in done))}"]
+        if skipped:
+            lines.append(f"\n**Not paid ({len(skipped)}):**")
+            lines += [f"<#{it['ticket']}> · {_money(it['amount']) if it['amount'] else 'amount not stated'}"
+                      for it in skipped[:30]]
+        self.stop()
+        await interaction.edit_original_response(content="\n".join(lines)[:2000], embed=None, view=None)
+
+    @discord.ui.button(label="Done - mark paid", style=discord.ButtonStyle.success, row=0)
+    async def done(self, interaction: discord.Interaction, button):
+        await interaction.response.defer()
+        item = self.items[self.i]
+        res = await mark_ticket_paid(item, interaction.user)
+        self.last = f"#{item['name']} marked paid ({_money(item['amount']) if item['amount'] else 'no amount'}) · {res}"
+        self.i += 1
+        await self.show(interaction)
+
+    @discord.ui.button(label="Skip", style=discord.ButtonStyle.secondary, row=0)
+    async def skip(self, interaction: discord.Interaction, button):
+        await interaction.response.defer()
+        self.items[self.i]["skipped"] = True
+        self.last = f"skipped #{self.items[self.i]['name']}"
+        self.i += 1
+        await self.show(interaction)
+
+    @discord.ui.button(label="Back", style=discord.ButtonStyle.secondary, row=0)
+    async def back(self, interaction: discord.Interaction, button):
+        await interaction.response.defer()
+        self.i = max(0, self.i - 1)
+        self.last = ""
+        await self.show(interaction)
+
+    @discord.ui.button(label="Copy wallet", style=discord.ButtonStyle.primary, row=1)
+    async def copy_wallet(self, interaction: discord.Interaction, button):
+        await interaction.response.send_message(self.items[self.i]["wallet"], ephemeral=True)
+
+    @discord.ui.button(label="Copy amount", style=discord.ButtonStyle.primary, row=1)
+    async def copy_amount(self, interaction: discord.Interaction, button):
+        amt = self.items[self.i]["amount"]
+        await interaction.response.send_message(f"{amt:.2f}" if amt else "No amount stated", ephemeral=True)
+
+    @discord.ui.button(label="Stop", style=discord.ButtonStyle.danger, row=1)
+    async def stop_btn(self, interaction: discord.Interaction, button):
+        await interaction.response.defer()
+        await self.finish(interaction)
+
+
+def bulk_line(it) -> str:
+    amt = _money(it["amount"]) if it["amount"] else "amount not stated"
+    who = f" · {it['user']}" if it["user"] else ""
+    return (f"<#{it['ticket']}>{who} · **{amt}** · {it['network'] or guess_network(it['wallet'])}"
+            f"\n`{it['wallet']}`")
+
+
+class BulkPayView(_OwnerView):
+    def __init__(self, user_id, items):
+        super().__init__(user_id)
+        self.items = items
+        batch = items[:25]  # Discord allows 25 options per menu
+        if batch:
+            sel = discord.ui.Select(
+                placeholder="Mark as paid (select the ones you've sent)...", min_values=1,
+                max_values=len(batch),
+                options=[discord.SelectOption(
+                    label=f"#{it['name']}"[:100], value=str(n),
+                    description=(f"{_money(it['amount'])} · " if it["amount"] else "") + it["wallet"][:12] + "...")
+                    for n, it in enumerate(batch)])
+            sel.callback = self.picked
+            self.add_item(sel)
+            self.sel = sel
+
+    async def picked(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        out = []
+        for v in self.sel.values:
+            it = self.items[int(v)]
+            if it["done"]:
+                continue
+            res = await mark_ticket_paid(it, interaction.user)
+            out.append(f"<#{it['ticket']}> · {_money(it['amount']) if it['amount'] else 'no amount'} · {res}")
+        await interaction.followup.send(("Marked paid:\n" + "\n".join(out))[:2000] if out else "Already done.",
+                                        ephemeral=True)
+
+    @discord.ui.button(label="Copy all as plain text", style=discord.ButtonStyle.primary)
+    async def plain(self, interaction: discord.Interaction, button):
+        rows = [f"{it['name']} | {_money(it['amount']) if it['amount'] else '?'} | "
+                f"{it['network'] or guess_network(it['wallet'])} | {it['wallet']}" for it in self.items]
+        chunks, buf = [], ""
+        for r in rows:
+            if len(buf) + len(r) + 1 > 1900:
+                chunks.append(buf); buf = ""
+            buf += r + "\n"
+        if buf:
+            chunks.append(buf)
+        await interaction.response.send_message(chunks[0], ephemeral=True)
+        for c in chunks[1:]:
+            await interaction.followup.send(c, ephemeral=True)
+
+
+async def send_bulk(interaction, items, on_hold):
+    total = sum(it["amount"] or 0 for it in items)
+    embeds = _chunks(f"TO PAY · {len(items)} · {_money(total)}", [bulk_line(it) for it in items], 0xDC2626)
+    if on_hold:
+        embeds += _chunks(f"RISK · ON HOLD · {len(on_hold)} (do not pay)",
+                          [f"<#{l['ticket']}> · {_money(owed_of(l))}" for l in on_hold], 0x7F1D1D)
+    note = ("Pick the ones you've sent in the menu to mark them paid (renames the ticket and messages the trader)."
+            + (" The menu shows the first 25; run /checkall again for the rest." if len(items) > 25 else ""))
+    await send_embeds(interaction, note, embeds, BulkPayView(interaction.user.id, items))
 
 
 async def run_check(interaction: discord.Interaction, include_tickets: bool, status: str):
@@ -1392,7 +1783,10 @@ async def run_check(interaction: discord.Interaction, include_tickets: bool, sta
     wanted = (order if status == "all" else
               ["PARTLY PAID", "PENDING"] if status == "PENDING_AND_PARTIAL" else [status])
     embeds = []
-    counts = {k: [l for l in ledgers if l["status"] == k] for k in order}
+    # risk-flagged tickets that aren't paid go in their own section, never in the "to pay" lists
+    on_hold = [l for l in ledgers if l["status"] != "PAID" and is_risky(l)]
+    hold_ids = {l["ticket"] for l in on_hold}
+    counts = {k: [l for l in ledgers if l["status"] == k and l["ticket"] not in hold_ids] for k in order}
     for key in wanted:
         items = sorted(counts[key], key=lambda l: l["opened"] or 0)
         if not items:
@@ -1403,6 +1797,14 @@ async def run_check(interaction: discord.Interaction, include_tickets: bool, sta
         money = f" · {_money(owed)} {'owed' if key in ('PARTLY PAID', 'PENDING') else 'paid'}" \
             if key != "NO WALLET" else ""
         embeds += _chunks(f"{label} · {len(items)}{money} ({desc})", [ledger_line(l) for l in items], colour)
+
+    hold_total = sum(owed_of(l) for l in on_hold)
+    hold_shown = [l for l in on_hold if l["status"] in wanted]
+    if hold_shown:
+        embeds += _chunks(f"RISK · ON HOLD · {len(hold_shown)} · {_money(sum(owed_of(l) for l in hold_shown))} "
+                          f"(do not pay - risk team sign-off needed)",
+                          [f"{l['status'].lower()} · " + ledger_line(l) for l in
+                           sorted(hold_shown, key=lambda l: l["opened"] or 0)], 0x7F1D1D)
 
     dupes, broken = find_junk(ids)
     if dupes:
@@ -1417,12 +1819,16 @@ async def run_check(interaction: discord.Interaction, include_tickets: bool, sta
     text = (f"**{where}** · {len(counts['PAID'])} paid · {len(counts['PARTLY PAID'])} partly paid · "
             f"{len(counts['PENDING'])} pending · {len(counts['CHECK'])} to check"
             + (f" · {len(counts['NO WALLET'])} no wallet" if include_tickets else "")
+            + (f" · {len(on_hold)} on risk hold" if on_hold else "")
             + f"\n**Still owed in total:** {_money(owed_total)}"
-            + "\nCheck a ticket, then run **/paid** inside it to log it and close it.")
+            + (f" (+ {_money(hold_total)} on risk hold)" if on_hold else "")
+            + "\nPress **Pay out** to go through them, or run **/paid** inside a ticket to log and close it.")
     if not embeds:
         text += "\n\nNothing in this category."
     shown = [l for l in ledgers if l["status"] in wanted]
-    view = CheckActionsView(interaction.user.id, dupes + broken, shown)
+    payable = sorted((l for k in ("PARTLY PAID", "PENDING") if k in wanted for l in counts[k] if l["wallets"]),
+                     key=lambda l: l["opened"] or 0)
+    view = CheckActionsView(interaction.user.id, dupes + broken, shown, payable, on_hold)
     if not view.children:
         view = None
     await send_embeds(interaction, text, embeds, view)
