@@ -1235,10 +1235,37 @@ def find_junk(channel_ids):
     return dupes, broken
 
 
-class TidyView(discord.ui.View):
-    def __init__(self, user_id, junk):
+STATUS_CODES = {"PENDING": "pg", "PARTLY PAID": "pl", "CHECK": "ck", "NO WALLET": "nw", "PAID": "pd"}
+STATUS_CODE_RE = re.compile(r"^(?:pg|pl|ck|nw|pd)-")
+
+
+def base_name(name: str) -> str:
+    """Ticket name without our status code (pg-/pl-/ck-/nw-/pd-)."""
+    return STATUS_CODE_RE.sub("", name or "")
+
+
+def status_name(name: str, status: str) -> str:
+    code = STATUS_CODES.get(status)
+    base = base_name(name)
+    return f"{code}-{base}"[:100] if code else base
+
+
+class CheckActionsView(discord.ui.View):
+    """Buttons under /check and /checkall: rename tickets by status, delete duplicate/broken posts."""
+
+    def __init__(self, user_id, junk, ledgers):
         super().__init__(timeout=900)
-        self.user_id, self.junk = user_id, junk
+        self.user_id, self.junk = user_id, list(junk)
+        self.ledgers = [l for l in ledgers if is_ticket_channel(l.get("channel"))]
+        if self.ledgers:
+            b = discord.ui.Button(label="Rename tickets by status (pg / pl / ck / nw / pd)",
+                                  style=discord.ButtonStyle.primary)
+            b.callback = self.rename
+            self.add_item(b)
+        if self.junk:
+            b = discord.ui.Button(label="Delete duplicates + broken posts", style=discord.ButtonStyle.danger)
+            b.callback = self.tidy
+            self.add_item(b)
 
     async def interaction_check(self, interaction):
         if interaction.user.id != self.user_id:
@@ -1247,11 +1274,37 @@ class TidyView(discord.ui.View):
             return False
         return True
 
-    @discord.ui.button(label="Delete duplicates + broken posts", style=discord.ButtonStyle.danger)
-    async def tidy(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def _lock(self, interaction, clicked_label):
         for item in self.children:
-            item.disabled = True
+            if getattr(item, "label", None) == clicked_label:
+                item.disabled = True
         await interaction.response.edit_message(view=self)
+
+    async def rename(self, interaction: discord.Interaction):
+        await self._lock(interaction, "Rename tickets by status (pg / pl / ck / nw / pd)")
+        done = same = failed = 0
+        for led in self.ledgers:
+            ch = led["channel"]
+            new = status_name(ch.name, led["status"])
+            if new == ch.name:
+                same += 1
+                continue
+            try:
+                # Discord allows ~2 renames per channel per 10 min; don't hang if we hit that
+                await asyncio.wait_for(ch.edit(name=new, reason=f"Payout status: {led['status']}"), timeout=15)
+                done += 1
+            except Exception:
+                failed += 1
+            await asyncio.sleep(0.5)
+        msg = f"Renamed **{done}** ticket(s)."
+        if same:
+            msg += f" {same} already had the right name."
+        if failed:
+            msg += f" {failed} couldn't be renamed (Discord limits renames to 2 per channel every 10 minutes - try again later)."
+        await interaction.followup.send(msg, ephemeral=True)
+
+    async def tidy(self, interaction: discord.Interaction):
+        await self._lock(interaction, "Delete duplicates + broken posts")
         done = failed = 0
         for p in self.junk:
             try:
@@ -1289,7 +1342,7 @@ async def run_check(interaction: discord.Interaction, include_tickets: bool, sta
         covered = {l["ticket"] for l in ledgers} | set(tracker.by_ticket().keys())
         chans = [c for c in interaction.guild.text_channels
                  if is_ticket_channel(c) and c.id not in covered
-                 and c.name.lower().startswith(CHECKALL_TICKET_PREFIXES)]
+                 and base_name(c.name.lower()).startswith(CHECKALL_TICKET_PREFIXES)]
         ledgers += await asyncio.gather(*(ledger_for_channel(c) for c in chans))
 
     for led in ledgers:  # keep the posts' status lines in sync while we're here
@@ -1332,7 +1385,10 @@ async def run_check(interaction: discord.Interaction, include_tickets: bool, sta
             + "\nCheck a ticket, then run **/paid** inside it to log it and close it.")
     if not embeds:
         text += "\n\nNothing in this category."
-    view = TidyView(interaction.user.id, dupes + broken) if (dupes or broken) else None
+    shown = [l for l in ledgers if l["status"] in wanted]
+    view = CheckActionsView(interaction.user.id, dupes + broken, shown)
+    if not view.children:
+        view = None
     await send_embeds(interaction, text, embeds, view)
 
 
