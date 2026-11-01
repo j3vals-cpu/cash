@@ -279,13 +279,14 @@ class TicketBot(discord.Client):
             await self.tree.sync(guild=guild)
         else:
             await self.tree.sync()
-        self.add_dynamic_items(CheckPaymentButton)  # 'Check payment' buttons keep working after restarts
+        self.add_dynamic_items(CheckPaymentButton, OpenTicketButton, VerifyButton, CloseTicketButton)  # 'Check payment' buttons keep working after restarts
         # Live payout feed runs in the background alongside the commands
         self.payout_feed = PayoutFeed(self)
         self.loop.create_task(self.payout_feed.run())
         self.loop.create_task(tracker.run())
         self.loop.create_task(daily_reset_loop())
         self.loop.create_task(rebuild_risk_from_category())
+        self.loop.create_task(mod_stats.save_loop())
         # Public API for the website's live payout feed (needs Railway public networking)
         import web_api
         self.loop.create_task(web_api.start(self.payout_feed))
@@ -415,6 +416,11 @@ NETWORK_CHOICES = [
 NETWORK_NAMES = {"bsc": "BNB Chain", "eth": "Ethereum", "sol": "Solana"}
 EXPLORERS = {"bsc": "https://bscscan.com/tx/", "eth": "https://etherscan.io/tx/", "sol": "https://solscan.io/tx/"}
 TICKET_CATEGORY_WORDS = [w.strip().lower() for w in os.getenv("TICKET_CATEGORY_WORDS", "support,ticket").split(",") if w.strip()]
+TICKET_TOPIC_MARK = "cashed-ticket"  # in the topic of every ticket our own bot opens
+
+
+def our_ticket(ch) -> bool:
+    return TICKET_TOPIC_MARK in (getattr(ch, "topic", None) or "")
 FIND_SCAN_MESSAGES = int(os.getenv("FIND_SCAN_MESSAGES", "300"))
 
 
@@ -422,7 +428,7 @@ async def find_wallet_mentions(guild: discord.Guild, wallet: str) -> list[tuple]
     """Channels (open tickets + payout channels) where the wallet was posted. Returns [(channel, message)]."""
     w = wallet.strip().lower()
     channels = [c for c in guild.text_channels
-                if c.category and any(word in c.category.name.lower() for word in TICKET_CATEGORY_WORDS)]
+                if our_ticket(c) or (c.category and any(word in c.category.name.lower() for word in TICKET_CATEGORY_WORDS))]
     for cid in (PAYOUT_CHANNEL_ID, LARGE_PAYOUT_CHANNEL_ID):
         ch = guild.get_channel(cid) if cid else None
         if ch and ch not in channels:
@@ -649,8 +655,8 @@ async def payout(interaction: discord.Interaction):
     channel = interaction.channel
     in_ticket = (isinstance(channel, (discord.TextChannel, discord.Thread))
                  and channel.id not in (PAYOUT_CHANNEL_ID, LARGE_PAYOUT_CHANNEL_ID, FEED_CHANNEL_ID_BOT)
-                 and getattr(channel, "category", None) is not None
-                 and any(w in channel.category.name.lower() for w in TICKET_CATEGORY_WORDS))
+                 and (our_ticket(channel) or (getattr(channel, "category", None) is not None
+                      and any(w in channel.category.name.lower() for w in TICKET_CATEGORY_WORDS))))
     if not in_ticket:
         await interaction.response.send_message("Run /payout inside the trader's ticket.", ephemeral=True)
         return
@@ -832,9 +838,10 @@ def wallets_in(text: str) -> list[str]:
 
 
 def is_ticket_channel(ch) -> bool:
-    return (ch is not None and getattr(ch, "category", None) is not None
-            and ch.id not in (PAYOUT_CHANNEL_ID, LARGE_PAYOUT_CHANNEL_ID, FEED_CHANNEL_ID_BOT, PAID_CLOSE_CHANNEL_ID)
-            and any(w in ch.category.name.lower() for w in TICKET_CATEGORY_WORDS))
+    if ch is None or ch.id in (PAYOUT_CHANNEL_ID, LARGE_PAYOUT_CHANNEL_ID, FEED_CHANNEL_ID_BOT, PAID_CLOSE_CHANNEL_ID):
+        return False
+    return our_ticket(ch) or (getattr(ch, "category", None) is not None
+                              and any(w in ch.category.name.lower() for w in TICKET_CATEGORY_WORDS))
 
 
 AMOUNTS_PROMPT = """You read a CASHED support ticket (Discord transcript) and list the payout amounts the trader is asking for.
@@ -1174,7 +1181,9 @@ async def read_ticket_for_ledger(ch, use_ai=True) -> dict:
     try:
         async for msg in ch.history(limit=FIND_SCAN_MESSAGES, oldest_first=True):
             msgs.append(msg)
-            if msg.author.bot:
+            # skip bots, except the payout form our own bot posts when it opens a ticket
+            if msg.author.bot and not (bot.user and msg.author.id == bot.user.id
+                                       and (msg.content or "").startswith(FORM_HEADER)):
                 continue
             for w in wallets_in(msg.content):
                 if w.lower() not in (x.lower() for x in wallets):
@@ -1909,6 +1918,12 @@ async def do_paid(interaction: discord.Interaction, led: dict, notify_trader: bo
         except Exception:
             pass
     where = f"<#{ch.id}>" if ch else "the ticket"
+    if ch is not None and our_ticket(ch):
+        await interaction.followup.send(
+            f"Logged in <#{PAID_CLOSE_CHANNEL_ID}> and removed {removed} payout post(s).\n"
+            f"Press **Close ticket** to save the transcript and close {where}.",
+            view=close_view(), ephemeral=True)
+        return
     await interaction.followup.send(
         f"Logged in <#{PAID_CLOSE_CHANNEL_ID}> and removed {removed} payout post(s).\n"
         f"**Now run `/ticket close` in {where}** to close it with Tickety.", ephemeral=True)
@@ -2218,6 +2233,517 @@ async def unhedge(interaction: discord.Interaction):
         f"Risk flag removed from {len(wallets)} wallet(s)." +
         (f" Moved back to **{back.name}**." if back else " (Couldn't work out the original category - move it manually.)"
          if ch.category_id == HEDGE_CATEGORY_ID else ""), ephemeral=True)
+
+
+# --------------------------------------------------------------------------- #
+# Payout tickets opened by our own bot - verified traders only
+#   /panel posts the "Open payout ticket" + "Verify" buttons
+# --------------------------------------------------------------------------- #
+
+VERIFIED_ROLE_ID = int(os.getenv("VERIFIED_ROLE_ID", "1565739044921675997") or 0)
+CASHED_API_URL = os.getenv("CASHED_API_URL", "").strip()   # Sam's lookup URL (optional until it's built)
+CASHED_API_KEY = os.getenv("CASHED_API_KEY", "").strip()
+CASHED_LINK_URL = os.getenv("CASHED_LINK_URL", "https://www.cashed.fun").strip()
+TRANSCRIPT_CHANNEL_ID = int(os.getenv("TRANSCRIPT_CHANNEL_ID", "0") or 0) or PAID_CLOSE_CHANNEL_ID
+FORM_HEADER = "### Payout request"
+
+
+async def cashed_lookup(discord_id) -> dict | None:
+    """Ask cashed.fun whether this Discord account is linked. None = API not set up / not reachable."""
+    if not (CASHED_API_URL and CASHED_API_KEY):
+        return None
+    import aiohttp
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=1.8)) as s:
+            async with s.get(CASHED_API_URL, params={"discord_id": str(discord_id)},
+                             headers={"Authorization": f"Bearer {CASHED_API_KEY}"}) as r:
+                if r.status != 200:
+                    log.warning("Cashed lookup returned HTTP %s", r.status)
+                    return None
+                return await r.json()
+    except Exception as e:
+        log.warning("Cashed lookup failed: %s", e)
+        return None
+
+
+def has_verified(member) -> bool:
+    return any(r.id == VERIFIED_ROLE_ID for r in getattr(member, "roles", []))
+
+
+async def give_verified(member) -> bool:
+    role = member.guild.get_role(VERIFIED_ROLE_ID) if getattr(member, "guild", None) else None
+    if role is None:
+        return False
+    try:
+        await member.add_roles(role, reason="Linked their Cashed account")
+        return True
+    except Exception:
+        log.exception("Couldn't give the verified role (bot needs Manage Roles and to sit above that role)")
+        return False
+
+
+def not_verified_msg() -> str:
+    return (f"You need to verify first. Link your Discord to your Cashed account in your dashboard: "
+            f"<{CASHED_LINK_URL}>\nOnce it's linked, press **Verify** and you'll be able to open a payout ticket.")
+
+
+def open_ticket_of(guild, user_id):
+    return next((c for c in guild.text_channels if our_ticket(c) and f"uid:{user_id}" in (c.topic or "")), None)
+
+
+def slug(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", (text or "").lower()).strip("-")[:60]
+
+
+def clean(text: str, n=200) -> str:
+    return (text or "").replace("`", "").replace("\n", " ").strip()[:n]  # pings are blocked by allowed_mentions
+
+
+class VerifyButton(discord.ui.DynamicItem[discord.ui.Button], template=r"cashed:verify"):
+    def __init__(self):
+        super().__init__(discord.ui.Button(label="Verify", style=discord.ButtonStyle.secondary,
+                                           custom_id="cashed:verify"))
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls()
+
+    async def callback(self, interaction: discord.Interaction):
+        if has_verified(interaction.user):
+            await interaction.response.send_message("You're already verified. You can open a payout ticket.",
+                                                    ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        info = await cashed_lookup(interaction.user.id)
+        if info and info.get("linked"):
+            if await give_verified(interaction.user):
+                await interaction.followup.send("Verified. You can now open a payout ticket.", ephemeral=True)
+            else:
+                await interaction.followup.send("Your account is linked, but I couldn't add the role. "
+                                                "Please contact support.", ephemeral=True)
+            return
+        if info is None and CASHED_API_URL:
+            await interaction.followup.send("Couldn't reach Cashed right now. Please try again in a minute.",
+                                            ephemeral=True)
+            return
+        await interaction.followup.send(not_verified_msg(), ephemeral=True)
+
+
+class PayoutForm(discord.ui.Modal, title="Payout request"):
+    def __init__(self, category_id: int, info: dict | None):
+        super().__init__(timeout=900)
+        self.category_id, self.info = category_id, info or {}
+        self.username = discord.ui.TextInput(label="Cashed username", max_length=60,
+                                             default=(self.info.get("username") or None))
+        self.email = discord.ui.TextInput(label="Cashed email", max_length=120,
+                                          default=(self.info.get("email") or None))
+        self.amount = discord.ui.TextInput(label="Payout amount (USD)", placeholder="e.g. 1500", max_length=40)
+        self.network = discord.ui.TextInput(label="Network", placeholder="e.g. USDC BEP-20, Solana", max_length=40)
+        self.wallet = discord.ui.TextInput(label="Wallet address", min_length=20, max_length=120)
+        for f in (self.username, self.email, self.amount, self.network, self.wallet):
+            self.add_item(f)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        guild, user = interaction.guild, interaction.user
+        existing = open_ticket_of(guild, user.id)
+        if existing:
+            await interaction.followup.send(f"You already have an open payout ticket: {existing.mention}",
+                                            ephemeral=True)
+            return
+        cat = guild.get_channel(self.category_id)
+        if not isinstance(cat, discord.CategoryChannel):
+            await interaction.followup.send("Payout tickets aren't set up properly. Please contact support.",
+                                            ephemeral=True)
+            return
+        overwrites = dict(cat.overwrites)
+        overwrites[guild.default_role] = discord.PermissionOverwrite(view_channel=False)
+        overwrites[user] = discord.PermissionOverwrite(view_channel=True, send_messages=True,
+                                                       read_message_history=True, attach_files=True,
+                                                       embed_links=True)
+        for rid in STAFF_ROLE_IDS:
+            role = guild.get_role(rid)
+            if role:
+                overwrites[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True,
+                                                               read_message_history=True, attach_files=True,
+                                                               manage_messages=True)
+        overwrites[guild.me] = discord.PermissionOverwrite(view_channel=True, send_messages=True,
+                                                           read_message_history=True, manage_channels=True,
+                                                           embed_links=True, attach_files=True)
+        name = f"payout-{slug(self.username.value) or slug(user.name) or user.id}"
+        try:
+            ch = await guild.create_text_channel(
+                name, category=cat, overwrites=overwrites,
+                topic=f"{TICKET_TOPIC_MARK} · Payout ticket · uid:{user.id}",
+                reason=f"Payout ticket for {user}")
+        except discord.HTTPException as e:
+            log.exception("Couldn't create payout ticket")
+            msg = ("The payout category is full (Discord allows 50 channels). Please try again later."
+                   if "50" in str(e) or "Maximum" in str(e) else "Couldn't open a ticket. Please contact support.")
+            await interaction.followup.send(msg, ephemeral=True)
+            return
+
+        wallet = clean(self.wallet.value, 120).replace(" ", "")
+        linked = self.info.get("linked")
+        lines = [FORM_HEADER,
+                 f"**User:** {clean(self.username.value, 60)}" + (" (linked account)" if linked else ""),
+                 f"**Email:** {clean(self.email.value, 120)}",
+                 f"**Amount:** {clean(self.amount.value, 40)}",
+                 f"**Network:** {clean(self.network.value, 40)}",
+                 "**Wallet:**", f"`{wallet}`"]
+        if linked and self.info.get("username") and \
+                self.info["username"].lower() != self.username.value.strip().lower():
+            lines.append(f"-# Note: linked Cashed account is **{clean(self.info['username'], 60)}**")
+        if not wallets_in(wallet):
+            lines.append("-# Note: this wallet address doesn't look like a normal EVM or Solana address - check it")
+        for p in (self.info.get("pending_payouts") or [])[:5]:
+            lines.append(f"-# Dashboard request {clean(str(p.get('id', '')), 40)}: "
+                         f"${float(p.get('amount_usd') or 0):,.2f} · {clean(str(p.get('network', '')), 20)} · "
+                         f"`{clean(str(p.get('wallet', '')), 120)}`")
+        await ch.send(f"{user.mention} thanks, your payout request has been received. "
+                      f"Our team will review it here.",
+                      allowed_mentions=discord.AllowedMentions(users=[user]))
+        await ch.send("\n".join(lines)[:2000], view=close_view(),
+                      allowed_mentions=discord.AllowedMentions.none())
+        await interaction.followup.send(f"Your payout ticket is open: {ch.mention}", ephemeral=True)
+
+
+class OpenTicketButton(discord.ui.DynamicItem[discord.ui.Button], template=r"cashed:open:(?P<cat>\d+)"):
+    """'Open payout ticket' on the panel. The category id is stored in the button, so it survives restarts."""
+
+    def __init__(self, category_id: int):
+        super().__init__(discord.ui.Button(label="Open payout ticket", style=discord.ButtonStyle.success,
+                                           custom_id=f"cashed:open:{category_id}"))
+        self.category_id = category_id
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls(int(match["cat"]))
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.guild is None:
+            return
+        existing = open_ticket_of(interaction.guild, interaction.user.id)
+        if existing:
+            await interaction.response.send_message(f"You already have an open payout ticket: {existing.mention}",
+                                                    ephemeral=True)
+            return
+        # quick look-up so the form can pre-fill their verified username + email (must answer within 3s)
+        info = await cashed_lookup(interaction.user.id)
+        verified = has_verified(interaction.user)
+        if not verified and info and info.get("linked"):
+            verified = await give_verified(interaction.user)
+        if not verified:
+            await interaction.response.send_message(not_verified_msg(), ephemeral=True)
+            return
+        await interaction.response.send_modal(PayoutForm(self.category_id, info if info and info.get("linked") else None))
+
+
+# ---- closing our own tickets (staff only): transcript -> log channel, then delete the channel
+
+async def save_transcript(ch, closed_by) -> bool:
+    if not TRANSCRIPT_CHANNEL_ID:
+        return False
+    import io
+    lines = [f"Ticket #{ch.name} · {ch.topic or ''}", f"Closed by {closed_by} at {datetime.now(timezone.utc):%Y-%m-%d %H:%M UTC}", ""]
+    async for m in ch.history(limit=None, oldest_first=True):
+        text = m.content or ""
+        for e in m.embeds:
+            text += f"\n[embed] {e.title or ''} {e.description or ''}"
+        for a in m.attachments:
+            text += f"\n[file] {a.url}"
+        lines.append(f"[{m.created_at:%Y-%m-%d %H:%M}] {m.author} ({m.author.id}): {text}")
+    uid = re.search(r"uid:(\d+)", ch.topic or "")
+    e = discord.Embed(title=f"Ticket closed · #{ch.name}", colour=0x6B7280, timestamp=datetime.now(timezone.utc))
+    if uid:
+        e.add_field(name="Trader", value=f"<@{uid.group(1)}>", inline=True)
+    e.add_field(name="Closed by", value=closed_by.mention, inline=True)
+    e.add_field(name="Opened", value=f"<t:{int(ch.created_at.timestamp())}:f>", inline=True)
+    log_ch = bot.get_channel(TRANSCRIPT_CHANNEL_ID) or await bot.fetch_channel(TRANSCRIPT_CHANNEL_ID)
+    await log_ch.send(embed=e, file=discord.File(io.BytesIO("\n".join(lines).encode()), filename=f"{ch.name}.txt"),
+                      allowed_mentions=discord.AllowedMentions.none())
+    return True
+
+
+class CloseConfirm(discord.ui.View):
+    def __init__(self, user_id, ch):
+        super().__init__(timeout=300)
+        self.user_id, self.ch = user_id, ch
+
+    @discord.ui.button(label="Yes, close it", style=discord.ButtonStyle.danger)
+    async def yes(self, interaction: discord.Interaction, button):
+        if interaction.user.id != self.user_id:
+            return await interaction.response.send_message("Not your button.", ephemeral=True)
+        await interaction.response.edit_message(content="Saving transcript and closing...", view=None)
+        try:
+            saved = await save_transcript(self.ch, interaction.user)
+        except Exception:
+            log.exception("Transcript failed")
+            await interaction.followup.send("Couldn't save the transcript, so the ticket was NOT closed.",
+                                            ephemeral=True)
+            return
+        try:
+            await self.ch.delete(reason=f"Closed by {interaction.user}")
+        except discord.NotFound:
+            pass
+        if interaction.channel and interaction.channel.id != self.ch.id:
+            await interaction.followup.send(f"Closed #{self.ch.name}" + (" · transcript saved." if saved else "."),
+                                            ephemeral=True)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def no(self, interaction: discord.Interaction, button):
+        await interaction.response.edit_message(content="Cancelled.", view=None)
+
+
+async def ask_close(interaction: discord.Interaction, ch):
+    if STAFF_ROLE_IDS and not is_staff(interaction.user):
+        await interaction.response.send_message("Only staff can close tickets.", ephemeral=True)
+        return
+    if ch is None or not our_ticket(ch):
+        await interaction.response.send_message("This isn't a payout ticket opened by Cashed Bot.", ephemeral=True)
+        return
+    await interaction.response.send_message(f"Close **#{ch.name}**? The transcript is saved first.",
+                                            view=CloseConfirm(interaction.user.id, ch), ephemeral=True)
+
+
+class CloseTicketButton(discord.ui.DynamicItem[discord.ui.Button], template=r"cashed:close"):
+    def __init__(self):
+        super().__init__(discord.ui.Button(label="Close ticket", style=discord.ButtonStyle.secondary,
+                                           custom_id="cashed:close"))
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls()
+
+    async def callback(self, interaction: discord.Interaction):
+        # from the /paid reply (ephemeral, in the ticket) or the button inside the ticket
+        await ask_close(interaction, interaction.channel)
+
+
+def close_view() -> discord.ui.View:
+    v = discord.ui.View(timeout=None)
+    v.add_item(CloseTicketButton())
+    return v
+
+
+@bot.tree.command(name="close", description="Save the transcript and close this payout ticket")
+async def close_cmd(interaction: discord.Interaction):
+    await ask_close(interaction, interaction.channel)
+
+
+@bot.tree.command(name="panel", description="Post the 'Open payout ticket' panel in this channel")
+@app_commands.describe(category="Category the payout tickets are created in")
+async def panel(interaction: discord.Interaction, category: discord.CategoryChannel):
+    if not (interaction.user.guild_permissions.administrator or is_staff(interaction.user)):
+        await interaction.response.send_message("Staff only.", ephemeral=True)
+        return
+    e = discord.Embed(
+        title="Payout requests",
+        description=(
+            "**How to request a payout**\n"
+            f"1. Link your Discord to your Cashed account in your dashboard: {CASHED_LINK_URL}\n"
+            "2. Press **Verify** to get the Verified role\n"
+            "3. Press **Open payout ticket** and fill in the form\n\n"
+            "Only verified accounts can open payout tickets. Make sure your wallet address and network are correct."),
+        colour=0x16A34A)
+    v = discord.ui.View(timeout=None)
+    v.add_item(OpenTicketButton(category.id))
+    v.add_item(VerifyButton())
+    v.add_item(discord.ui.Button(label="Link account", style=discord.ButtonStyle.link, url=CASHED_LINK_URL))
+    await interaction.channel.send(embed=e, view=v)
+    await interaction.response.send_message(f"Panel posted. Tickets will open in **{category.name}**.", ephemeral=True)
+
+
+# --------------------------------------------------------------------------- #
+# Mod activity: messages sent + estimated active time over any window   (/mod stat)
+# --------------------------------------------------------------------------- #
+
+MOD_ROLE_IDS = {int(x) for x in os.getenv("MOD_ROLE_IDS", "1351115065910362223").split(",") if x.strip()}
+MOD_ACTIVE_GAP = int(os.getenv("MOD_ACTIVE_GAP_MIN", "10")) * 60   # a gap longer than this ends a session
+MOD_SESSION_PAD = int(os.getenv("MOD_SESSION_PAD_MIN", "2")) * 60  # time counted per session (reading/typing)
+MOD_KEEP_DAYS = 35
+
+
+def uk_day(ts: float) -> str:
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.fromtimestamp(ts, ZoneInfo("Europe/London")).strftime("%Y-%m-%d")
+    except Exception:
+        return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d")
+
+
+def uk_midnight(ts: float) -> float:
+    try:
+        from zoneinfo import ZoneInfo
+        d = datetime.fromtimestamp(ts, ZoneInfo("Europe/London"))
+    except Exception:
+        d = datetime.fromtimestamp(ts, timezone.utc)
+    return d.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+
+
+def fmt_dur(sec: float) -> str:
+    m = int(sec // 60)
+    return f"{m // 60}h {m % 60:02d}m" if m >= 60 else f"{m}m"
+
+
+def active_time(times: list[float]) -> float:
+    """Messages less than MOD_ACTIVE_GAP apart form one session; each session counts its span + a pad."""
+    total, start, last = 0.0, None, None
+    for t in times:
+        if last is None or t - last > MOD_ACTIVE_GAP:
+            if last is not None:
+                total += (last - start) + MOD_SESSION_PAD
+            start = t
+        last = t
+    if last is not None:
+        total += (last - start) + MOD_SESSION_PAD
+    return total
+
+
+class ModStats:
+    """Every mod message's time + channel (last 35 days), so any window can be counted exactly.
+    Saved to /data so it survives restarts (needs the Railway volume)."""
+
+    FILE = os.path.join(DATA_DIR, "mod_activity.json")
+
+    def __init__(self):
+        self.msgs: dict[str, list] = {}   # user id -> [[ts, channel id], ...] oldest first
+        self.names: dict[str, str] = {}
+        self.dirty = False
+        try:
+            with open(self.FILE, encoding="utf-8") as f:
+                d = json.load(f)
+            self.msgs, self.names = d.get("msgs", {}), d.get("names", {})
+        except FileNotFoundError:
+            pass
+        except Exception:
+            log.exception("Couldn't read mod stats")
+
+    def add(self, user, channel, ts: float):
+        self.msgs.setdefault(str(user.id), []).append([int(ts), getattr(channel, "id", 0)])
+        self.names[str(user.id)] = user.display_name
+        self.dirty = True
+
+    def window(self, start: float, end: float) -> dict:
+        """{user id: {c, act, days, first, last, top_channel, times}} for messages in [start, end)."""
+        out = {}
+        for uid, rows in self.msgs.items():
+            rows = sorted((r for r in rows if start <= r[0] < end), key=lambda r: r[0])
+            if not rows:
+                continue
+            times = [r[0] for r in rows]
+            ch = {}
+            for _, cid in rows:
+                ch[cid] = ch.get(cid, 0) + 1
+            out[uid] = {"c": len(rows), "act": active_time(times), "first": times[0], "last": times[-1],
+                        "days": len({uk_day(t) for t in times}), "top": max(ch, key=ch.get), "times": times}
+        return out
+
+    def save(self):
+        if not self.dirty:
+            return
+        cutoff = time.time() - MOD_KEEP_DAYS * 86400
+        self.msgs = {u: [r for r in rows if r[0] >= cutoff] for u, rows in self.msgs.items()}
+        self.msgs = {u: rows for u, rows in self.msgs.items() if rows}
+        try:
+            os.makedirs(DATA_DIR, exist_ok=True)
+            tmp = self.FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"msgs": self.msgs, "names": self.names}, f, separators=(",", ":"))
+            os.replace(tmp, self.FILE)
+            self.dirty = False
+        except Exception:
+            log.exception("Couldn't save mod stats")
+
+    async def save_loop(self):
+        while True:
+            await asyncio.sleep(60)
+            self.save()
+
+
+mod_stats = ModStats()
+
+
+def is_mod(member) -> bool:
+    return any(r.id in MOD_ROLE_IDS for r in getattr(member, "roles", []))
+
+
+@bot.event
+async def on_message(message: discord.Message):
+    if message.guild is None or message.author.bot:
+        return
+    if is_mod(message.author):
+        mod_stats.add(message.author, message.channel, message.created_at.timestamp())
+
+
+MOD_PERIODS = [
+    app_commands.Choice(name="Last 24 hours", value="h24"),
+    app_commands.Choice(name="Today (since midnight)", value="today"),
+    app_commands.Choice(name="Last 3 days", value="d3"),
+    app_commands.Choice(name="Last 5 days", value="d5"),
+    app_commands.Choice(name="Last 7 days", value="d7"),
+    app_commands.Choice(name="Last 30 days", value="d30"),
+]
+PERIOD_SECONDS = {"h24": 86400, "d3": 3 * 86400, "d5": 5 * 86400, "d7": 7 * 86400, "d30": 30 * 86400}
+
+mod_group = app_commands.Group(name="mod", description="Moderator activity")
+
+
+@mod_group.command(name="stat", description="Messages sent and time active for each mod")
+@app_commands.describe(period="Time window (default: last 24 hours)", member="Show one mod day by day")
+@app_commands.choices(period=MOD_PERIODS)
+async def mod_stat(interaction: discord.Interaction, period: app_commands.Choice[str] = None,
+                   member: discord.Member = None):
+    if STAFF_ROLE_IDS and not is_staff(interaction.user):
+        await interaction.response.send_message("This command is for staff only.", ephemeral=True)
+        return
+    p = period.value if period else "h24"
+    label = period.name if period else "Last 24 hours"
+    now = time.time()
+    start = uk_midnight(now) if p == "today" else now - PERIOD_SECONDS[p]
+    short = p in ("h24", "today")
+    stats = mod_stats.window(start, now + 1)
+    gap_note = f"Active time = messages less than {MOD_ACTIVE_GAP // 60} min apart count as one session."
+
+    if member:  # one mod, day by day
+        s = stats.get(str(member.id))
+        lines = []
+        if s:
+            by_day = {}
+            for t in s["times"]:
+                by_day.setdefault(uk_day(t), []).append(t)
+            for d, ts in sorted(by_day.items(), reverse=True):
+                lines.append(f"`{d}` · **{len(ts)}** messages · **{fmt_dur(active_time(ts))}** active · "
+                             f"<t:{ts[0]}:t> - <t:{ts[-1]}:t>")
+        head = (f"**{s['c']}** messages · **{fmt_dur(s['act'])}** active · most in <#{s['top']}>\n\n"
+                if s else "No messages in this period.")
+        e = discord.Embed(title=f"{member.display_name} · {label}", description=(head + "\n".join(lines))[:4000],
+                          colour=0x3B82F6)
+        e.set_footer(text=gap_note)
+        await interaction.response.send_message(embed=e, ephemeral=True)
+        return
+
+    ranked = sorted(stats.items(), key=lambda kv: kv[1]["c"], reverse=True)
+    n_days = max(1, round((now - start) / 86400))
+    lines = []
+    for i, (uid, s) in enumerate(ranked, 1):
+        line = f"**{i}. <@{uid}>** · **{s['c']}** messages · **{fmt_dur(s['act'])}** active"
+        if short:
+            line += f"\n-# <t:{s['first']}:t> - <t:{s['last']}:t> · most in <#{s['top']}>"
+        else:
+            line += (f"\n-# active {s['days']}/{n_days} days · avg {s['c'] // s['days']} msgs, "
+                     f"{fmt_dur(s['act'] / s['days'])} per active day · most in <#{s['top']}>")
+        lines.append(line)
+    head = (f"**{len(ranked)}** mods · **{sum(s['c'] for _, s in ranked)}** messages · "
+            f"**{fmt_dur(sum(s['act'] for _, s in ranked))}** active in total\n"
+            f"-# Since <t:{int(start)}:f>\n")
+    embeds = _chunks(f"Mod activity · {label}", [head] + (lines or ["No mod messages in this period."]), 0x3B82F6)
+    embeds[-1].set_footer(text=f"Counts every message from the mod role. {gap_note} Mods with 0 messages aren't listed.")
+    await interaction.response.send_message(embeds=embeds[:10], ephemeral=True,
+                                            allowed_mentions=discord.AllowedMentions.none())
+
+
+bot.tree.add_command(mod_group)
 
 
 @bot.event
