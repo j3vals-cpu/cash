@@ -2690,10 +2690,11 @@ mod_group = app_commands.Group(name="mod", description="Moderator activity")
 
 
 @mod_group.command(name="stat", description="Messages sent and time active for each mod")
-@app_commands.describe(period="Time window (default: last 24 hours)", member="Show one mod day by day")
+@app_commands.describe(period="Time window (default: last 24 hours)", member="Show one mod day by day",
+                       private="Only you can see the result (default: everyone in the channel sees it)")
 @app_commands.choices(period=MOD_PERIODS)
 async def mod_stat(interaction: discord.Interaction, period: app_commands.Choice[str] = None,
-                   member: discord.Member = None):
+                   member: discord.Member = None, private: bool = False):
     if STAFF_ROLE_IDS and not is_staff(interaction.user):
         await interaction.response.send_message("This command is for staff only.", ephemeral=True)
         return
@@ -2720,7 +2721,8 @@ async def mod_stat(interaction: discord.Interaction, period: app_commands.Choice
         e = discord.Embed(title=f"{member.display_name} · {label}", description=(head + "\n".join(lines))[:4000],
                           colour=0x3B82F6)
         e.set_footer(text=gap_note)
-        await interaction.response.send_message(embed=e, ephemeral=True)
+        await interaction.response.send_message(embed=e, ephemeral=private,
+                                                allowed_mentions=discord.AllowedMentions.none())
         return
 
     ranked = sorted(stats.items(), key=lambda kv: kv[1]["c"], reverse=True)
@@ -2739,7 +2741,7 @@ async def mod_stat(interaction: discord.Interaction, period: app_commands.Choice
             f"-# Since <t:{int(start)}:f>\n")
     embeds = _chunks(f"Mod activity · {label}", [head] + (lines or ["No mod messages in this period."]), 0x3B82F6)
     embeds[-1].set_footer(text=f"Counts every message from the mod role. {gap_note} Mods with 0 messages aren't listed.")
-    await interaction.response.send_message(embeds=embeds[:10], ephemeral=True,
+    await interaction.response.send_message(embeds=embeds[:10], ephemeral=private,
                                             allowed_mentions=discord.AllowedMentions.none())
 
 
