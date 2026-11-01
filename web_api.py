@@ -12,6 +12,7 @@ Endpoints
   GET /api/stats?period=all|1d|7d|30d|90d
 """
 
+import hmac
 import logging
 import os
 import time
@@ -22,6 +23,8 @@ from payout_feed import MIN_PAYOUT_USD, NETWORK_ICONS, NETWORKS, TIERS
 
 log = logging.getLogger("web-api")
 
+OFFICE_KEY = os.getenv("OFFICE_KEY", "").strip()  # private key for the office screen (/office?key=...)
+OFFICE_PAGE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "office.html")
 ALLOWED_ORIGINS = [o.strip() for o in os.getenv("WEB_ALLOWED_ORIGINS", "*").split(",") if o.strip()]
 PERIOD_DAYS = {"all": None, "1d": 1, "7d": 7, "30d": 30, "90d": 90}
 MAX_LIMIT = 100
@@ -125,7 +128,12 @@ def _num(value, cast, default=None):
         return default
 
 
-def make_app(feed) -> web.Application:
+def _office_ok(request) -> bool:
+    key = request.query.get("key") or request.headers.get("X-Office-Key") or ""
+    return bool(OFFICE_KEY) and hmac.compare_digest(key.encode(), OFFICE_KEY.encode())
+
+
+def make_app(feed, office=None) -> web.Application:
     cache = {"at": 0.0, "count": -1, "payouts": []}
 
     def current():
@@ -156,21 +164,155 @@ def make_app(feed) -> web.Application:
     async def options(request):
         return _cors(request, web.Response(status=204))
 
-    app = web.Application()
+    # ---- office screen (private: needs ?key=OFFICE_KEY)
+    async def office_page(request):
+        if not _office_ok(request):
+            return web.Response(status=403, text="Wrong or missing key.")
+        with open(OFFICE_PAGE, encoding="utf-8") as f:
+            html = f.read()
+        resp = web.Response(text=html, content_type="text/html")
+        resp.headers["Cache-Control"] = "no-store"
+        resp.headers["X-Robots-Tag"] = "noindex"
+        return resp
+
+    async def office_data(request):
+        if not _office_ok(request) or office is None:
+            return web.json_response({"error": "unauthorized"}, status=403)
+        try:
+            data = await office.get()
+        except Exception:
+            log.exception("Office data failed")
+            return web.json_response({"error": "unavailable"}, status=503)
+        resp = web.json_response(data)
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
+
+    async def office_todo_done(request):
+        if not _office_ok(request) or office is None:
+            return web.json_response({"error": "unauthorized"}, status=403)
+        try:
+            body = await request.json()
+            ok = office.todo_done(int(body.get("id")))
+        except Exception:
+            ok = False
+        return web.json_response({"ok": ok}, status=200 if ok else 404)
+
+    app = web.Application(client_max_size=6 * 1024 * 1024)
     app.router.add_get("/api/health", health)
     app.router.add_get("/api/payouts", payouts)
     app.router.add_get("/api/stats", stats_view)
     app.router.add_route("OPTIONS", "/api/{tail:.*}", options)
+    async def office_setup(request):  # the Pi setup script (no secrets in it - the key is passed when you run it)
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "setup_office_pi.sh")
+        with open(path, encoding="utf-8") as f:
+            return web.Response(text=f.read(), content_type="text/plain")
+
+    # ---- office speaker (the Pi's announcer script polls these)
+    async def office_rundown(request):
+        if not _office_ok(request) or office is None:
+            return web.json_response({"error": "unauthorized"}, status=403)
+        try:
+            return web.json_response({"text": await office.boot_summary()})
+        except Exception:
+            log.exception("Rundown failed")
+            return web.json_response({"error": "unavailable"}, status=503)
+
+    async def office_rundown_now(request):  # touchscreen button: queue a rundown for the speaker
+        if not _office_ok(request) or office is None:
+            return web.json_response({"error": "unauthorized"}, status=403)
+        try:
+            await office.queue_rundown()
+            return web.json_response({"ok": True})
+        except Exception:
+            log.exception("Rundown (button) failed")
+            return web.json_response({"error": "unavailable"}, status=503)
+
+    async def office_voice(request):
+        if not _office_ok(request) or office is None:
+            return web.json_response({"error": "unauthorized"}, status=403)
+        after = _num(request.query.get("after"), int, -1)
+        items = office.announcements(-1)
+        last = max((i["id"] for i in items), default=0)
+        quiet = office.is_quiet() if hasattr(office, "is_quiet") else False
+        if after < 0:  # first call after the Pi starts: don't replay old announcements
+            return web.json_response({"items": [], "last": last, "quiet": quiet})
+        return web.json_response({"items": [i for i in items if i["id"] > after], "last": last, "quiet": quiet})
+
+    async def office_listen(request):  # "Hey Ultra ..." audio from the Pi
+        if not _office_ok(request) or office is None:
+            return web.json_response({"error": "unauthorized"}, status=403)
+        audio = await request.read()
+        if not audio or len(audio) > 5_000_000:
+            return web.json_response({"error": "no audio"}, status=400)
+        try:
+            return web.json_response(await office.voice_command(audio))
+        except Exception as e:
+            log.exception("Voice command failed")
+            return web.json_response({"heard": "", "reply": "Sorry, voice control isn't working right now."}, status=200)
+
+    app.router.add_post("/office/listen", office_listen)
+    # ---- Spotify: one-time login + music dimming while Ultra talks
+    async def spotify_login(request):
+        if not _office_ok(request) or office is None:
+            return web.Response(status=403, text="Wrong or missing key.")
+        url = office.spotify_login_url(request.query.get("key", ""))
+        if not url:
+            return web.Response(text="Add SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET in Railway first.")
+        raise web.HTTPFound(url)
+
+    async def spotify_callback(request):
+        state = request.query.get("state", "")
+        if not OFFICE_KEY or not hmac.compare_digest(state.encode(), OFFICE_KEY.encode()):
+            return web.Response(status=403, text="Login link expired - start again from /office/spotify/login.")
+        if request.query.get("error"):
+            return web.Response(text=f"Spotify said: {request.query['error']}")
+        try:
+            await office.spotify_callback(request.query.get("code", ""))
+        except Exception as e:
+            log.exception("Spotify login failed")
+            return web.Response(text=f"Spotify login failed: {e}")
+        return web.Response(text="Spotify connected. You can close this page - try 'Hey Ultra, play some music'.")
+
+    async def office_duck(request):
+        if not _office_ok(request) or office is None:
+            return web.json_response({"error": "unauthorized"}, status=403)
+        await office.duck(request.query.get("on") == "1")
+        return web.json_response({"ok": True})
+
+    app.router.add_get("/office/spotify/login", spotify_login)
+    app.router.add_get("/office/spotify/callback", spotify_callback)
+    app.router.add_post("/office/duck", office_duck)
+    app.router.add_get("/office/rundown", office_rundown)
+    app.router.add_post("/office/rundown-now", office_rundown_now)
+    app.router.add_get("/office/voice", office_voice)
+    app.router.add_get("/office", office_page)
+    app.router.add_get("/office/setup.sh", office_setup)
+
+    async def office_announcer_file(request):  # the Pi's speaker script (no secrets in it)
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "office_announcer.py")
+        with open(path, encoding="utf-8") as f:
+            return web.Response(text=f.read(), content_type="text/plain")
+
+    app.router.add_get("/office/announcer.py", office_announcer_file)
+
+    async def office_listener_file(request):  # the Pi's "Hey Ultra" listener (no secrets in it)
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "office_listener.py")
+        with open(path, encoding="utf-8") as f:
+            return web.Response(text=f.read(), content_type="text/plain")
+
+    app.router.add_get("/office/listener.py", office_listener_file)
+    app.router.add_get("/office/data", office_data)
+    app.router.add_post("/office/todo-done", office_todo_done)
     return app
 
 
-async def start(feed):
+async def start(feed, office=None):
     """Start the API on Railway's PORT (does nothing if PORT isn't set)."""
     port = os.getenv("PORT")
     if not port:
         log.info("Web API off (no PORT set)")
         return
-    runner = web.AppRunner(make_app(feed), access_log=None)
+    runner = web.AppRunner(make_app(feed, office), access_log=None)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", int(port)).start()
     log.info("Web API listening on port %s", port)

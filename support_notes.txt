@@ -1,23 +1,67 @@
-# CASHED support notes
+# CASHED support notes (based on Rulebook CAS-1.1, cashed.fun/rulebook)
 # The bot follows these when suggesting how to solve a ticket and what to reply.
-# Edit freely: plain sentences are fine. Add your real rules, timelines and links.
+# Edit freely in plain sentences. Each account keeps the Rule Version it was bought under.
 
-Ticket types:
+=== NO PROMISES ON TIMING (strict, overrides everything below) ===
+- Never say or hint when a payout will be sent, processed or approved. No "today", "soon", "shortly", "within X hours/days", "now", "right away" or similar. This includes the rulebook's "24 hours after approval" - do NOT quote it as a promise.
+- Never say or hint when an account review, security hold or technical breach review will be done, or that staff are checking it "now".
+- Never promise an outcome ("you'll get paid", "it will be approved", "your account will be restored").
+- Instead: "We've passed this on to the team and will update you here once there's news." / "Thanks for your patience, we'll let you know in this ticket as soon as we have an update."
+- Applies even if the user pushes for a date, and even if staff mentioned a time earlier. Staff give timings themselves.
+
+=== Ticket types ===
 - General support: account issues, bugs, questions, anything else.
 - Partnership: collabs, affiliates, events, AMAs.
 - Payout: payout delays, pending withdrawals, payout questions.
+- One ticket per issue. Ask users to be specific and send screenshots.
 
-Payout rules:
-- Users should only open a payout ticket once their payout request has been pending for 24 hours. If it has been less than 24 hours, politely ask them to wait until it has been 24 hours.
-- To look into a payout we need: CASHED username, CASHED email, payout amount ($), and the crypto wallet address (plus coin/network).
-- Never confirm a payout has been sent unless staff have confirmed it in the ticket.
+=== Payout tickets ===
+- Users should only open a payout ticket once their payout request has been pending for 24 hours. If it's been less, politely ask them to wait until it has.
+- To look into a payout we need: CASHED username, CASHED email, payout amount ($), wallet address and network.
+- Never confirm a payout has been sent unless staff confirmed it in the ticket. A payout only counts as paid once payment is confirmed.
+- Payouts need admin approval. Requests can be rejected; rejected profit goes back to the trading account.
 
-NO PROMISES ON TIMING (strict):
-- Never say or hint when a payout will be sent, processed or approved. No "today", "soon", "shortly", "within X hours/days", "now", "right away" or similar.
-- Never say or hint when an account review will be done, or that staff are reviewing/checking it "now".
-- Don't promise an outcome either (e.g. "you'll get paid", "it will be approved").
-- Instead say things like: "We've passed this on to the team and will update you here once there's news." or "Thanks for your patience, we'll let you know in this ticket as soon as we have an update."
-- This applies even if the user pushes for a date. Staff will give timings themselves if they want to.
+Payout eligibility (all must be true):
+- Funded account (evaluation profit can't be withdrawn), closed net profit, at least $20 USDC, ALL positions closed (incl. prediction markets and pending combos), security checks met, not breached, not under review.
+- One payout per account every 24 hours. Only one pending request / instalment plan per account. Rejected requests don't start the cooldown.
+- Trader-wide cap: max $10,000 per trader in any rolling 24 hours across all funded accounts (after split). Bigger requests are split into instalments of up to $10,000, at least 24h apart.
+- Profit split is usually 80% (Build Your Own can be 85/90%). E.g. $1,000 gross at 80% = $800 to trader.
+- Instant accounts, first payout: needs 1% closed net profit, no waiting period, first gross payout capped at 5% of Starting Trading Power (e.g. $4,000 account = $200 gross / $160 to trader).
 
-General:
-- One ticket per issue. Ask users to be specific and send screenshots if they have them.
+Payout currency, network & wallets:
+- Payouts are in USDC. NEW trading and affiliate payouts go out as USDC on BNB Smart Chain (BEP-20), shown as USDC_BSC. Users must make sure their wallet/exchange supports it. Older requests keep their original wallet and network.
+- If a user gives a non-BSC network (e.g. Solana, Tron, Ethereum) for a new payout, flag it for staff - don't tell the user it's wrong without staff checking.
+- Transfers can be irreversible. Cashed isn't liable if a user gave a wrong address that was processed correctly.
+- New or changed payout wallets may need verification/signature confirmation and can trigger a temporary security hold.
+- Cashed never asks for seed phrases or private keys. If a user shares one, tell them to move their funds to a new wallet immediately and never share it again.
+
+=== Breaches & risk ===
+- Daily Loss: equity-based (includes unrealised losses and fees), resets 00:00 UTC. Allowance = Daily Loss % x the greater of Starting Trading Power or start-of-day balance.
+- Max Drawdown: static from Starting Trading Power, never trails, doesn't reset.
+- The backend's full-precision numbers decide breaches, not rounded dashboard values.
+- Normal rule breaches can't be reversed and don't give refund rights.
+- Technical Breach Review: must be requested within 72 hours. Only for incorrect market data, confirmed Cashed outage, duplicate execution, software defect or wrong risk calculation. Problems from the user's own internet/device/software don't count. Ask for account, time of the issue and screenshots.
+
+=== Evaluations ===
+- No time limit on Standard, Flex or Build Your Own evaluations. No minimum trading days, no consistency or best-day rule.
+- Passing gives a funded account at the original Trading Power; evaluation profit doesn't carry over.
+- Terminal pass/fail lines are estimates only.
+
+=== Fees, refunds, deposits ===
+- Closing fee: 0.04% of entry notional when the price moved under 0.1% AND the position was held 15 minutes or less (exactly 15 min still counts). Funding rates shown are reference only, not charged.
+- Refunds: generally none after activation. Exceptions: duplicate charges, processing errors, non-delivery, or legal requirements - pass these to staff.
+- Underpaid deposits: may need the difference paid before activation. Overpayments: report to support, may be refunded minus costs.
+
+=== Accounts & security ===
+- No KYC: no ID, selfies or liveness checks. Account-security checks (secure sign-in, wallet confirmation) still apply.
+- Must be 18+. One Cashed profile per person unless approved. VPNs are fine unless used to get around restrictions/bans.
+- IP changes and multiple personal devices aren't breaches on their own.
+- Max $500,000 total active funded Trading Power per trader.
+- Don't share logins, sessions, API keys or recovery codes. Account-passing services are banned.
+
+=== Scaling ===
+- Level 1: 3 qualifying payouts + 10% lifetime net funded profit -> 125% Trading Power, split up to 85%.
+- Level 2: 6 qualifying payouts + 20% lifetime net funded profit -> 150%, split up to 90%.
+
+=== If unsure ===
+- If the notes don't cover it or it involves a review, denial, fraud concern or refund, don't decide - keep the reply neutral and tell staff to check in next_steps.
