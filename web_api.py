@@ -242,10 +242,11 @@ def make_app(feed, office=None) -> web.Application:
         if not _office_ok(request) or office is None:
             return web.json_response({"error": "unauthorized"}, status=403)
         audio = await request.read()
-        if not audio or len(audio) > 5_000_000:
+        text = (request.query.get("text") or "")[:500]
+        if (not audio and not text) or len(audio) > 5_000_000:
             return web.json_response({"error": "no audio"}, status=400)
         try:
-            return web.json_response(await office.voice_command(audio))
+            return web.json_response(await office.voice_command(audio, text))
         except Exception as e:
             log.exception("Voice command failed")
             return web.json_response({"heard": "", "reply": "Sorry, voice control isn't working right now."}, status=200)

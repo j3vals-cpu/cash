@@ -18,6 +18,7 @@ import struct
 import subprocess
 import sys
 import time
+import urllib.parse
 import urllib.request
 import wave
 
@@ -97,8 +98,20 @@ def record_command(proc, ambient=300.0, max_s=12.0, silence_s=1.3):
     return buf.getvalue()
 
 
-def send(base, key, wav):
-    req = urllib.request.Request(f"{base}/office/listen?key={urllib.parse.quote(key)}", data=wav, method="POST",
+def local_transcript(model, wav: bytes) -> str:
+    """Free offline speech-to-text with the same Vosk model (used when the bot has no OpenAI key)."""
+    from vosk import KaldiRecognizer
+    with wave.open(io.BytesIO(wav)) as w:
+        frames = w.readframes(w.getnframes())
+    rec = KaldiRecognizer(model, RATE)
+    for i in range(0, len(frames), CHUNK * 2):
+        rec.AcceptWaveform(frames[i:i + CHUNK * 2])
+    return json.loads(rec.FinalResult()).get("text", "")
+
+
+def send(base, key, wav, text=""):
+    q = urllib.parse.urlencode({"key": key, "text": text})
+    req = urllib.request.Request(f"{base}/office/listen?{q}", data=wav, method="POST",
                                  headers={"Content-Type": "audio/wav"})
     with urllib.request.urlopen(req, timeout=90) as r:
         return json.loads(r.read().decode())
@@ -140,7 +153,9 @@ def main():
                 speaker.duck(False)
                 continue
             try:
-                d = send(base, key, wav)
+                text = local_transcript(model, wav)
+                log("Heard (local):", text)
+                d = send(base, key, wav, text)
                 log("Heard:", d.get("heard"), "| Reply:", d.get("reply"))
                 speaker.say(d.get("reply") or "Sorry, I didn't catch that.")
             except Exception as e:

@@ -3391,8 +3391,8 @@ class OfficeData:
         text = await self.boot_summary()
         voice.add(text, "Office screen", kind="rundown")
 
-    async def voice_command(self, audio: bytes) -> dict:
-        return await handle_voice_command(audio)
+    async def voice_command(self, audio: bytes, text: str = "") -> dict:
+        return await handle_voice_command(audio, text)
 
     async def duck(self, on: bool):
         await spotify.duck(on)
@@ -3822,12 +3822,22 @@ async def _run_voice_tool(name, args, who="Voice") -> str:
     return "unknown action"
 
 
-async def handle_voice_command(audio: bytes) -> dict:
-    heard = await transcribe(audio)
+async def handle_voice_command(audio: bytes, text_hint: str = "") -> dict:
+    # Whisper if an OpenAI key is set (more accurate); otherwise use the text the Pi worked out itself (free, offline)
+    if OPENAI_API_KEY and audio:
+        try:
+            heard = await transcribe(audio)
+        except Exception as e:
+            log.warning("Whisper failed (%s), using the Pi's own transcript", e)
+            heard = text_hint.strip()
+    else:
+        heard = text_hint.strip()
     if not heard:
         return {"heard": "", "reply": "Sorry, I didn't catch that."}
     data = await office.get()
-    system = ("You are Ultra, the voice assistant in the team's office (they run Cashed, a crypto prop firm), "
+    system = ("The words were transcribed by a basic offline speech recogniser, so they may contain mistakes: "
+              "work out the most likely meaning (e.g. 'cast' or 'cash' may mean Cashed, 'vote' may mean Vault). "
+              "You are Ultra, the voice assistant in the team's office (they run Cashed, a crypto prop firm), "
               "speaking through a speaker. If asked your name, you're Ultra. "
               "Replies are read aloud: one or two short plain sentences, no lists, no emojis, no markdown, "
               "say amounts naturally (e.g. '1,500 dollars'). Use the tools to do what is asked; answer questions "
