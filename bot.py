@@ -294,6 +294,10 @@ class TicketBot(discord.Client):
             guild = discord.Object(id=int(GUILD_ID))
             self.tree.copy_global_to(guild=guild)
             await self.tree.sync(guild=guild)
+            # Cashed commands live only in the Cashed server: wipe any old copies published to every server,
+            # so the office server doesn't show Cashed commands (and Cashed never shows office ones)
+            self.tree.clear_commands(guild=None)
+            await self.tree.sync()
         else:
             await self.tree.sync()
         if OFFICE_GUILD_ID:
