@@ -151,7 +151,7 @@ def _say(text):
         except Exception as e:
             log("Piper failed:", e)
     if shutil.which("espeak-ng"):
-        subprocess.run(["espeak-ng", "-v", "en-gb", "-s", "160", text], check=False)
+        subprocess.run(["espeak-ng", "-v", "en-us", "-s", "160", text], check=False)
 
 
 _cec_ready = False

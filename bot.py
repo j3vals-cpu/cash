@@ -3791,7 +3791,7 @@ GEMINI_MODELS = [m.strip() for m in os.getenv("GEMINI_MODELS", "gemini-flash-lat
 GEMINI_TTS_MODELS = [m.strip() for m in os.getenv(
     "GEMINI_TTS_MODELS", "gemini-2.5-flash-preview-tts,gemini-3.1-flash-tts-preview,gemini-3.8-flash-tts").split(",") if m.strip()]
 GEMINI_VOICE = os.getenv("GEMINI_VOICE", "Charon")
-GEMINI_STYLE = os.getenv("GEMINI_STYLE", "Say this naturally, in a friendly, confident British accent, like a sharp office assistant:")
+GEMINI_STYLE = os.getenv("GEMINI_STYLE", "Say this naturally, in a friendly, confident, neutral American accent, like a sharp office assistant:")
 GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
 
 
@@ -4831,9 +4831,9 @@ bot.tree.add_command(jukebox_group)
 # Used by the office screen on laptops/phones and by the Pi, so everything sounds the same.
 # --------------------------------------------------------------------------- #
 
-TTS_VOICE = os.getenv("TTS_VOICE", "en_GB-cori-high")          # any voice from huggingface.co/rhasspy/piper-voices
+TTS_VOICE = os.getenv("TTS_VOICE", "en_US-ryan-high")          # any voice from huggingface.co/rhasspy/piper-voices
 OPENAI_TTS_VOICE = os.getenv("OPENAI_TTS_VOICE", "ash")
-OPENAI_TTS_STYLE = os.getenv("OPENAI_TTS_STYLE", "Speak naturally with a friendly, confident British accent, like a sharp office "
+OPENAI_TTS_STYLE = os.getenv("OPENAI_TTS_STYLE", "Speak naturally with a friendly, confident, neutral American accent, like a sharp office "
                              "assistant. Warm, upbeat, clear and not too fast.")
 PIPER_DIR = os.path.join(DATA_DIR, "piper-server")
 PIPER_RELEASE = "https://github.com/rhasspy/piper/releases/download/2023.11.14-2/piper_linux_x86_64.tar.gz"
@@ -4891,7 +4891,7 @@ class UltraVoice:
             return self.ready
 
     async def _openai(self, text: str) -> bytes | None:
-        """Newest OpenAI voice with a British style; falls back to tts-1 if that model isn't available."""
+        """Newest OpenAI voice with an American style; falls back to tts-1 if that model isn't available."""
         attempts = [{"model": "gpt-4o-mini-tts", "voice": OPENAI_TTS_VOICE, "instructions": OPENAI_TTS_STYLE},
                     {"model": "tts-1-hd", "voice": "fable"}]
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=90)) as s:

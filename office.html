@@ -528,8 +528,8 @@
     try {
       const u = new SpeechSynthesisUtterance(text);
       const v = speechSynthesis.getVoices();
-      u.voice = v.find(x => /en-GB/i.test(x.lang) && /natural|online/i.test(x.name)) || v.find(x => /en-GB/i.test(x.lang)) || v.find(x => /^en/i.test(x.lang)) || null;
-      u.lang = "en-GB"; u.rate = 1.02;
+      u.voice = v.find(x => /en-US/i.test(x.lang) && /natural|online/i.test(x.name)) || v.find(x => /en-US/i.test(x.lang)) || v.find(x => /^en/i.test(x.lang)) || null;
+      u.lang = "en-US"; u.rate = 1.02;
       speechSynthesis.speak(u);
     } catch (e) {}
   }

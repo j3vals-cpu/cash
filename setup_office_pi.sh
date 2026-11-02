@@ -38,7 +38,7 @@ if [ -n "$PIPER_TAR" ] && [ ! -x "$HOME/piper/piper" ]; then
     || echo "   (Piper download failed - the backup voice will be used)"
 fi
 if [ -x "$HOME/piper/piper" ] && [ ! -f "$HOME/piper/voice.onnx" ]; then
-  V=https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_GB/alan/medium/en_GB-alan-medium.onnx
+  V=https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/ryan/medium/en_US-ryan-medium.onnx
   curl -fsSL -o "$HOME/piper/voice.onnx" "$V" && curl -fsSL -o "$HOME/piper/voice.onnx.json" "$V.json" \
     || echo "   (Voice download failed - the backup voice will be used)"
 fi
