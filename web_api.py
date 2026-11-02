@@ -207,6 +207,17 @@ def make_app(feed, office=None) -> web.Application:
         with open(path, encoding="utf-8") as f:
             return web.Response(text=f.read(), content_type="text/plain")
 
+    async def office_quick_setup(request):  # short code so the Pi installer is quick to type: curl -sL <base>/pi/<code> | bash
+        import hashlib
+        code = hashlib.sha256(("pi-setup:" + OFFICE_KEY).encode()).hexdigest()[:6] if OFFICE_KEY else ""
+        if not code or not hmac.compare_digest(request.match_info.get("code", "").lower().encode(), code.encode()):
+            return web.Response(status=404, text="Not found")
+        base = f"{request.scheme}://{request.host}"
+        if request.headers.get("X-Forwarded-Proto") == "https" or "railway.app" in request.host:
+            base = f"https://{request.host}"
+        script = (f'#!/bin/bash\ncurl -sL "{base}/office/setup.sh" | bash -s "{base}/office?key={OFFICE_KEY}"\n')
+        return web.Response(text=script, content_type="text/plain")
+
     # ---- office speaker (the Pi's announcer script polls these)
     async def office_rundown(request):
         if not _office_ok(request) or office is None:
@@ -317,6 +328,7 @@ def make_app(feed, office=None) -> web.Application:
     app.router.add_get("/office/voice", office_voice)
     app.router.add_get("/office", office_page)
     app.router.add_get("/office/setup.sh", office_setup)
+    app.router.add_get("/pi/{code}", office_quick_setup)
 
     async def office_announcer_file(request):  # the Pi's speaker script (no secrets in it)
         path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "office_announcer.py")
