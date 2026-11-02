@@ -278,6 +278,11 @@
     .cashed .kv, .mini .s { display: none; }
   }
   /* ---- Ultra voice graphic ---- */
+  #tapSound { position: fixed; left: 50%; bottom: 28px; transform: translateX(-50%); z-index: 30; display: none;
+    padding: 12px 22px; border: 1px solid var(--gold); border-radius: 999px; background: rgba(8,10,14,.92); color: var(--gold);
+    font-size: 15px; letter-spacing: .04em; cursor: pointer; }
+  #tapSound.show { display: block; animation: tapPulse 1.6s ease-in-out infinite; }
+  @keyframes tapPulse { 50% { box-shadow: 0 0 0 8px rgba(142,197,255,.12); } }
   #voice { position: fixed; inset: 0; z-index: 20; display: none; flex-direction: column; align-items: center; justify-content: center;
     background: radial-gradient(ellipse at 50% 40%, rgba(20,34,52,.97), rgba(5,5,6,.985) 60%); text-align: center; padding: 4vh 6vw; }
   #voice.on { display: flex; animation: vin .25s ease-out; }
@@ -391,6 +396,7 @@
 </main>
 
 
+<div id="tapSound">Ultra has something to say. Click anywhere to hear it.</div>
 <div id="voice" aria-live="polite">
   <div class="orb"><i></i><i></i><i></i><b></b></div>
   <div class="vs" id="vState">Listening…</div>
@@ -481,16 +487,41 @@
     if (ON_PI || !soundOn || quiet || !text) return;
     speakChain = speakChain.then(() => playVoice(text)).catch(() => {});
   }
+  // Browsers block sound until the page has been clicked once. We unlock an audio player on the first
+  // click/tap/key and play Ultra's voice through it, instead of falling back to the robotic browser voice.
+  let actx = null, unlockWaiters = [];
+  function audioCtx() {
+    if (!actx) { const C = window.AudioContext || window.webkitAudioContext; if (C) actx = new C(); }
+    return actx;
+  }
+  function unlockAudio() {
+    const c = audioCtx(); if (!c) return;
+    c.resume().then(() => {
+      $("tapSound").classList.remove("show");
+      unlockWaiters.splice(0).forEach(f => f());
+    }).catch(() => {});
+  }
+  ["pointerdown", "keydown", "touchstart"].forEach(ev => document.addEventListener(ev, unlockAudio, { passive: true }));
+  function audioReady() {
+    const c = audioCtx();
+    if (!c || c.state === "running") return Promise.resolve();
+    $("tapSound").classList.add("show");
+    return new Promise(res => unlockWaiters.push(res));
+  }
   async function playVoice(text) {
+    let buf;
     try {  // Ultra's natural voice, made on the server
       const r = await fetch("/office/tts?key=" + encodeURIComponent(KEY), { method: "POST",
         headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text }) });
       if (!r.ok) throw new Error(r.status);
-      const url = URL.createObjectURL(await r.blob()), a = new Audio(url);
-      await a.play();
-      await new Promise(res => { a.onended = res; a.onerror = res; });
-      URL.revokeObjectURL(url);
-    } catch (e) { browserSpeak(text); }
+      buf = await r.arrayBuffer();
+    } catch (e) { browserSpeak(text); return; }  // server down: last resort only
+    const c = audioCtx();
+    if (!c) { const a = new Audio(URL.createObjectURL(new Blob([buf], { type: "audio/wav" }))); try { await a.play(); await new Promise(res => { a.onended = res; a.onerror = res; }); } catch (e) {} return; }
+    await audioReady();
+    const data = await c.decodeAudioData(buf);
+    const src = c.createBufferSource(); src.buffer = data; src.connect(c.destination);
+    await new Promise(res => { src.onended = res; src.start(); });
   }
   function browserSpeak(text) {  // backup only
     if (!("speechSynthesis" in window)) return;

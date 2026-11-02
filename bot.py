@@ -995,6 +995,28 @@ def build_ledger(ticket_id: int, posts: list[dict], wallets=(), requested=None, 
                     hashes.add(h["hash"]); payouts.append(h)
     payouts.sort(key=lambda h: h["ts"])
 
+    # Backup: nothing paid to the posted wallet(s), but a payout of the EXACT requested amount (to the cent)
+    # went out after the request, to a wallet no other ticket asked for -> count it (e.g. trader changed wallet
+    # in the ticket and the ticket has since been deleted). Shown with a note so staff can check the tx.
+    amount_matched = []
+    if feed and feed.index_ready and reqs and not payouts:
+        other_wallets = {p["wallet"].lower() for p in tracker.posts.values()
+                         if p["ticket"] != ticket_id and p.get("wallet")}
+        start = min((p["created"] for p in posts), default=opened) - PAID_EARLY_WINDOW
+        for r in reqs:
+            if r < 20:
+                continue  # small round amounts are too common to match safely
+            cands = [h for h in feed.find_amount(r, 0.01)
+                     if h["ts"] >= start and h["hash"] not in hashes
+                     and not any((t or "").lower() in other_wallets for t in h["to"])]
+            if len(cands) == 1:
+                hashes.add(cands[0]["hash"]); payouts.append(cands[0]); amount_matched.append(cands[0])
+        payouts.sort(key=lambda h: h["ts"])
+        if amount_matched and not note:
+            to = (amount_matched[0]["to"] or ["?"])[0]
+            note = (f"matched by exact amount - paid to {to[:6]}…{to[-4:]}, not the wallet on the request. "
+                    f"Check the tx")
+
     matched, outstanding, extra = settle(reqs, payouts)
     paid_total = round(sum(h["usd"] or 0 for h in payouts), 2)
     requested_total = round(sum(reqs), 2)
@@ -1265,7 +1287,7 @@ def _txs(payouts, n=4):
 
 
 def ledger_line(led: dict) -> str:
-    line = f"<#{led['ticket']}>"
+    line = f"<#{led['ticket']}>" if led.get("channel") is not None else "(deleted ticket)"
     if risk.flags_for(led["wallets"]) or risk.ticket_flagged(led.get("channel")):
         line = "**[RISK]** " + line
     if led.get("user"):
