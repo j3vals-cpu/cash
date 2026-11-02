@@ -2925,6 +2925,150 @@ bot.tree.add_command(mod_group)
 
 
 # --------------------------------------------------------------------------- #
+# /tag: ping people or roles by ID (for people who don't show up when you type @, or roles that can't be pinged)
+# --------------------------------------------------------------------------- #
+
+class TagStore:
+    FILE = os.path.join(DATA_DIR, "tag_groups.json")
+
+    def __init__(self):
+        self.groups: dict[str, list[int]] = {}
+        try:
+            with open(self.FILE, encoding="utf-8") as f:
+                self.groups = {k: [int(x) for x in v] for k, v in json.load(f).items()}
+        except FileNotFoundError:
+            # starter group: the two people + role you asked for (change with /tag save team ...)
+            self.groups = {"team": [436235833163644928, 1059872205909000233, 1351115065910362223]}
+        except Exception:
+            log.exception("Couldn't read tag groups")
+
+    def save(self):
+        try:
+            os.makedirs(DATA_DIR, exist_ok=True)
+            tmp = self.FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self.groups, f)
+            os.replace(tmp, self.FILE)
+        except Exception:
+            log.exception("Couldn't save tag groups")
+
+
+tag_store = TagStore()
+tag_group = app_commands.Group(name="tag", description="Ping people or roles by ID, even if they can't be @tagged")
+
+
+def _parse_targets(text: str) -> list[int]:
+    """IDs from text: plain numbers, <@123>, <@!123>, <@&123>, or a saved group name."""
+    ids = []
+    for part in re.split(r"[\s,]+", (text or "").strip()):
+        if not part:
+            continue
+        name = part.lower()
+        if name in tag_store.groups:
+            ids += tag_store.groups[name]
+            continue
+        m = re.fullmatch(r"<@[!&]?(\d{15,21})>|(\d{15,21})", part)
+        if m:
+            ids.append(int(m.group(1) or m.group(2)))
+    out = []
+    for i in ids:
+        if i not in out:
+            out.append(i)
+    return out
+
+
+def _mention(guild: discord.Guild | None, target_id: int) -> str:
+    if guild and guild.get_role(target_id):
+        return f"<@&{target_id}>"
+    return f"<@{target_id}>"
+
+
+async def _tag_staff_ok(interaction: discord.Interaction) -> bool:
+    if STAFF_ROLE_IDS and not is_staff(interaction.user):
+        await interaction.response.send_message("This command is for staff only.", ephemeral=True)
+        return False
+    return True
+
+
+async def _group_autocomplete(interaction: discord.Interaction, current: str):
+    return [app_commands.Choice(name=f"{n} ({len(v)})", value=n)
+            for n, v in sorted(tag_store.groups.items()) if current.lower() in n][:25]
+
+
+@tag_group.command(name="send", description="Post a message that pings people/roles by ID or a saved group")
+@app_commands.describe(who="IDs (user or role), @mentions, or a saved group name - separate with spaces",
+                       message="What to say (optional)")
+@app_commands.autocomplete(who=_group_autocomplete)
+async def tag_send(interaction: discord.Interaction, who: str, message: str = ""):
+    if not await _tag_staff_ok(interaction):
+        return
+    ids = _parse_targets(who)
+    if not ids:
+        await interaction.response.send_message(
+            "I couldn't find any IDs or saved groups in that. Example: `436235833163644928 1351115065910362223`",
+            ephemeral=True)
+        return
+    pings = " ".join(_mention(interaction.guild, i) for i in ids)
+    content = f"{pings}\n{message}".strip()[:2000]
+    await interaction.response.send_message("Sent.", ephemeral=True)
+    try:
+        await interaction.channel.send(content, allowed_mentions=discord.AllowedMentions(
+            users=True, roles=True, everyone=False))
+    except discord.Forbidden:
+        await interaction.followup.send("I can't post in this channel.", ephemeral=True)
+    roles_blocked = [i for i in ids if interaction.guild and (r := interaction.guild.get_role(i))
+                     and not r.mentionable and not interaction.guild.me.guild_permissions.mention_everyone]
+    if roles_blocked:
+        await interaction.followup.send(
+            "Heads up: a role in that list won't actually ping, because the bot doesn't have **Mention @everyone, "
+            "@here and All Roles**. Turn that on for the Cashed Bot role in Server Settings → Roles.", ephemeral=True)
+
+
+@tag_group.command(name="save", description="Save a list of people/roles under a short name, e.g. 'team'")
+@app_commands.describe(name="Short name, e.g. team", who="IDs (user or role) or @mentions, separated by spaces")
+async def tag_save(interaction: discord.Interaction, name: str, who: str):
+    if not await _tag_staff_ok(interaction):
+        return
+    name = re.sub(r"\s+", "-", name.strip().lower())[:30]
+    ids = [i for i in _parse_targets(who)]
+    if not name or not ids:
+        await interaction.response.send_message("Give a name and at least one ID.", ephemeral=True)
+        return
+    tag_store.groups[name] = ids
+    tag_store.save()
+    await interaction.response.send_message(
+        f"Saved **{name}**: {' '.join(_mention(interaction.guild, i) for i in ids)}\n"
+        f"Use `/tag send who:{name} message:...`", ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+
+
+@tag_group.command(name="list", description="Show saved tag groups")
+async def tag_list(interaction: discord.Interaction):
+    if not await _tag_staff_ok(interaction):
+        return
+    if not tag_store.groups:
+        await interaction.response.send_message("No saved groups yet. Use `/tag save`.", ephemeral=True)
+        return
+    lines = [f"**{n}**: {' '.join(_mention(interaction.guild, i) for i in v)}" for n, v in sorted(tag_store.groups.items())]
+    await interaction.response.send_message("\n".join(lines)[:2000], ephemeral=True,
+                                            allowed_mentions=discord.AllowedMentions.none())
+
+
+@tag_group.command(name="delete", description="Delete a saved tag group")
+@app_commands.autocomplete(name=_group_autocomplete)
+async def tag_delete(interaction: discord.Interaction, name: str):
+    if not await _tag_staff_ok(interaction):
+        return
+    if tag_store.groups.pop(name.strip().lower(), None) is None:
+        await interaction.response.send_message("No group with that name.", ephemeral=True)
+        return
+    tag_store.save()
+    await interaction.response.send_message(f"Deleted **{name}**.", ephemeral=True)
+
+
+bot.tree.add_command(tag_group)
+
+
+# --------------------------------------------------------------------------- #
 # Morning briefing: what needs doing, weather, yesterday's payouts, markets, team to-do list
 # --------------------------------------------------------------------------- #
 
