@@ -113,7 +113,7 @@ xset s off 2>/dev/null; xset -dpms 2>/dev/null; xset s noblank 2>/dev/null
 command -v unclutter >/dev/null && (unclutter -idle 3 &)
 sleep 5                                    # let Wi-Fi connect
 while true; do
-  $BROWSER --kiosk --incognito --noerrdialogs --disable-infobars --disable-session-crashed-bubble \\
+  $BROWSER --kiosk --incognito --password-store=basic --noerrdialogs --disable-infobars --disable-session-crashed-bubble \\
     --autoplay-policy=no-user-gesture-required --check-for-update-interval=31536000 \\
     --overscroll-history-navigation=0 --disable-pinch --touch-events=enabled \\
     --disable-features=Translate,TouchpadOverscrollHistoryNavigation \\
