@@ -4497,6 +4497,55 @@ async def _run_voice_tool(name, args, who="Voice") -> str:  # noqa: F811  (adds 
     return await _run_voice_tool_jb(name, args, who)
 
 
+@office_group.command(name="commands", description="Post the guide to every office command and voice phrase in this channel")
+async def office_commands(interaction: discord.Interaction):
+    if not office_allowed(interaction):
+        return await interaction.response.send_message("This command is for the office team.", ephemeral=True)
+    blue = 0x8EC5FF
+    e1 = discord.Embed(title="Office commands", colour=blue,
+                       description="Everything the office bot and **Ultra** can do. Type `/` to see them all.")
+    e1.add_field(name="Reminders and rundown", inline=False, value=(
+        "`/office note` \u2014 reminder read out in the next rundown (when the TV turns on)\n"
+        "`/office notes` \u2014 see or clear waiting reminders\n"
+        "`/office rundown` \u2014 Ultra reads the rundown now\n"
+        "`/office say` \u2014 announce something out loud + on the TV\n"
+        "`/office shoutout` \u2014 shout-out on the TV, read out"))
+    e1.add_field(name="Timers, quiet and birthdays", inline=False, value=(
+        "`/office timer` \u2014 countdown on the screen (`cancel: True` to stop)\n"
+        "`/office quiet` \u2014 mute chimes and announcements for a while\n"
+        "`/office birthday` \u2014 add (`name` + `date` 14/03), remove or list birthdays"))
+    e1.add_field(name="Video ideas", inline=False, value=(
+        "`/office ideas` \u2014 today's full video briefs (`new: True` for fresh ones, `on_tv: True` to show + read them)"))
+    e1.add_field(name="Music", inline=False, value=(
+        "`/jukebox request` \u2014 request a song for the office speaker\n"
+        "`/jukebox queue` \u2014 what's playing and up next\n"
+        "`/office music` \u2014 play, pause, skip, back, volume"))
+    e1.add_field(name="Vault payouts", inline=False, value=(
+        "`/vault add` \u2014 log a payout (`trader`, `amount`, optional `date` 2026-10-28, `note`)\n"
+        "`/vault list` \u2014 totals per trader + latest\n"
+        "`/vault remove` \u2014 delete one by its #"))
+    e1.add_field(name="To-do list", inline=False, value=(
+        "`/todo add` \u00b7 `/todo list` \u00b7 `/todo done` (or tap twice on the screen)"))
+    e2 = discord.Embed(title="Say \u201cHey Ultra\u2026\u201d", colour=blue, description="Wait for the beep, then say what you want.")
+    e2.add_field(name="Questions", inline=False, value=(
+        "\u201cWhat have we paid out today?\u201d \u00b7 \u201cWhat's left to pay?\u201d \u00b7 \u201cWhich tickets need a reply?\u201d\n"
+        "\u201cWhat's the weather?\u201d \u00b7 \u201cWhen's the next US news?\u201d \u00b7 \u201cHow's Nasdaq?\u201d"))
+    e2.add_field(name="Do things", inline=False, value=(
+        "\u201cRemind me tomorrow to chase the affiliate\u201d\n"
+        "\u201cAdd film the payout video to the to-do list\u201d \u00b7 \u201cTick off number 2\u201d\n"
+        "\u201cLog a Vault payout for Jay, 1,500 dollars\u201d\n"
+        "\u201cAnnounce lunch is here\u201d \u00b7 \u201cShout-out to Sam for smashing it\u201d\n"
+        "\u201c15-minute timer for the meeting\u201d \u00b7 \u201cQuiet mode for an hour\u201d\n"
+        "\u201cJay's birthday is 14 March\u201d \u00b7 \u201cPlay the rundown\u201d"))
+    e2.add_field(name="Video ideas and music", inline=False, value=(
+        "\u201cGive us a video idea\u201d \u00b7 \u201cGive E3 a video idea\u201d \u00b7 \u201cNew video ideas\u201d\n"
+        "\u201cPlay some deep house\u201d \u00b7 \u201cQueue Blinding Lights\u201d \u00b7 \u201cSkip\u201d \u00b7 \u201cTurn it up\u201d"))
+    e2.add_field(name="Automatic", inline=False, value=(
+        "\u2022 Turn the TV on \u2192 rundown (Discord to-dos + chat, your reminders, weather and the day)\n"
+        "\u2022 8am briefing in #briefing \u00b7 payout alerts on the TV \u00b7 new video ideas every day"))
+    await interaction.response.send_message(embeds=[e1, e2])
+
+
 bot.tree.add_command(office_group)
 
 
