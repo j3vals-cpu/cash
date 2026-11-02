@@ -2708,6 +2708,7 @@ class TicketReplies:
     def __init__(self):
         self.last: dict[int, dict] = {}     # channel id -> {"ts", "staff", "name"}
         self.staff_ids: set[int] = set()    # people seen with a staff role (so we can tell from history too)
+        self.not_staff: set[int] = set()    # looked up: not staff
         try:
             with open(self.FILE, encoding="utf-8") as f:
                 self.staff_ids = set(json.load(f))
@@ -2715,6 +2716,27 @@ class TicketReplies:
             pass
         except Exception:
             log.exception("Couldn't read staff_seen file")
+
+    async def _check_staff(self, guild, user_id: int) -> bool:
+        """Look up someone's roles (works without the members intent) and remember the answer."""
+        try:
+            member = guild.get_member(user_id) or await guild.fetch_member(user_id)
+        except Exception:
+            member = None  # left the server: treat as a trader
+        if member is not None and is_staff(member):
+            self.staff_ids.add(user_id)
+            self._save()
+            return True
+        self.not_staff.add(user_id)
+        return False
+
+    def _save(self):
+        try:
+            os.makedirs(DATA_DIR, exist_ok=True)
+            with open(self.FILE, "w", encoding="utf-8") as f:
+                json.dump(sorted(self.staff_ids), f)
+        except Exception:
+            pass
 
     def note(self, message: discord.Message):
         a = message.author
@@ -2743,8 +2765,10 @@ class TicketReplies:
                 try:
                     async for m in c.history(limit=1):
                         a = m.author
-                        self.last[c.id] = {"ts": int(m.created_at.timestamp()),
-                                           "staff": a.bot or a.id in self.staff_ids, "name": a.display_name}
+                        staff = a.bot or a.id in self.staff_ids
+                        if not staff and a.id not in self.not_staff:
+                            staff = await self._check_staff(guild, a.id)
+                        self.last[c.id] = {"ts": int(m.created_at.timestamp()), "staff": staff, "name": a.display_name}
                 except Exception:
                     self.last[c.id] = {"ts": 0, "staff": True, "name": ""}
 
