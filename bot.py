@@ -3761,6 +3761,117 @@ async def office_rundown(interaction: discord.Interaction):
 
 
 # --------------------------------------------------------------------------- #
+# Gemini (free Google AI Studio key): speech-to-text for "Hey Ultra" and Ultra's natural voice
+# --------------------------------------------------------------------------- #
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_MODELS = [m.strip() for m in os.getenv("GEMINI_MODELS", "gemini-flash-latest,gemini-2.5-flash").split(",") if m.strip()]
+GEMINI_TTS_MODELS = [m.strip() for m in os.getenv(
+    "GEMINI_TTS_MODELS", "gemini-2.5-flash-preview-tts,gemini-3.1-flash-tts-preview,gemini-3.8-flash-tts").split(",") if m.strip()]
+GEMINI_VOICE = os.getenv("GEMINI_VOICE", "Charon")
+GEMINI_STYLE = os.getenv("GEMINI_STYLE", "Say this naturally, in a friendly, confident British accent, like a sharp office assistant:")
+GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
+
+
+def _pcm_to_wav(pcm: bytes, rate=24000) -> bytes:
+    import io, wave
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1); w.setsampwidth(2); w.setframerate(rate); w.writeframes(pcm)
+    return buf.getvalue()
+
+
+def _find_audio(obj):
+    """Find base64 audio anywhere in a Gemini response. Returns (bytes, mime) or (None, None)."""
+    import base64
+    if isinstance(obj, dict):
+        data = obj.get("data")
+        mime = obj.get("mimeType") or obj.get("mime_type") or ""
+        if isinstance(data, str) and len(data) > 200 and ("audio" in mime or not mime):
+            try:
+                return base64.b64decode(data), mime
+            except Exception:
+                pass
+        for v in obj.values():
+            a, m = _find_audio(v)
+            if a:
+                return a, m
+    elif isinstance(obj, list):
+        for v in obj:
+            a, m = _find_audio(v)
+            if a:
+                return a, m
+    return None, None
+
+
+async def _gemini_post(path, body, timeout=60):
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout)) as s:
+        async with s.post(f"{GEMINI_BASE}/{path}", json=body, headers={"x-goog-api-key": GEMINI_API_KEY}) as r:
+            txt = await r.text()
+            if r.status != 200:
+                raise RuntimeError(f"HTTP {r.status}: {txt[:200]}")
+            return json.loads(txt)
+
+
+async def gemini_transcribe(audio: bytes) -> str:
+    import base64
+    body = {"contents": [{"parts": [
+        {"text": "Transcribe exactly what is said in this short office voice command. Words like Ultra, Cashed, Vault "
+                 "and Nasdaq are common. Reply with only the words spoken, nothing else."},
+        {"inline_data": {"mime_type": "audio/wav", "data": base64.b64encode(audio).decode()}}]}]}
+    last = None
+    for model in GEMINI_MODELS:
+        try:
+            d = await _gemini_post(f"models/{model}:generateContent", body)
+            parts = ((d.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
+            return "".join(p.get("text", "") for p in parts).strip().strip('"')
+        except Exception as e:
+            last = e
+    raise RuntimeError(f"Gemini transcription failed: {last}")
+
+
+_gemini_tts_ok = {"how": None}  # remembers which model/endpoint worked
+
+
+async def gemini_speak(text: str) -> bytes | None:
+    prompt = f"{GEMINI_STYLE} {text}"
+    tries = []
+    for model in GEMINI_TTS_MODELS:
+        tries.append(("generate", model))
+        tries.append(("interactions", model))
+    if _gemini_tts_ok["how"] in tries:  # try what worked last time first
+        tries.remove(_gemini_tts_ok["how"]); tries.insert(0, _gemini_tts_ok["how"])
+    for how in tries:
+        kind, model = how
+        try:
+            if kind == "generate":
+                d = await _gemini_post(f"models/{model}:generateContent", {
+                    "contents": [{"parts": [{"text": prompt}]}],
+                    "generationConfig": {"responseModalities": ["AUDIO"], "speechConfig": {
+                        "voiceConfig": {"prebuiltVoiceConfig": {"voiceName": GEMINI_VOICE}}}}}, timeout=90)
+            else:
+                d = await _gemini_post("interactions", {
+                    "model": model,
+                    "input": [{"type": "user_input", "content": [{"type": "text", "text": prompt}]}],
+                    "response_format": {"type": "audio"},
+                    "generation_config": {"speech_config": [{"voice": GEMINI_VOICE}]}}, timeout=90)
+            audio, mime = _find_audio(d)
+            if not audio:
+                continue
+            _gemini_tts_ok["how"] = how
+            if audio[:4] == b"RIFF":
+                return audio
+            rate = 24000
+            m = re.search(r"rate=(\d+)", mime or "")
+            if m:
+                rate = int(m.group(1))
+            return _pcm_to_wav(audio, rate)
+        except Exception as e:
+            log.warning("Gemini voice (%s %s) failed: %s", kind, model, str(e)[:160])
+    return None
+
+
+# --------------------------------------------------------------------------- #
 # Voice control: "Hey Ultra, ..." -> Whisper (speech to text) -> Claude (does it) -> spoken reply
 # --------------------------------------------------------------------------- #
 
@@ -3868,13 +3979,18 @@ async def _run_voice_tool(name, args, who="Voice") -> str:
 
 async def handle_voice_command(audio: bytes, text_hint: str = "") -> dict:
     # Whisper if an OpenAI key is set (more accurate); otherwise use the text the Pi worked out itself (free, offline)
+    heard = ""
     if OPENAI_API_KEY and audio:
         try:
             heard = await transcribe(audio)
         except Exception as e:
-            log.warning("Whisper failed (%s), using the Pi's own transcript", e)
-            heard = text_hint.strip()
-    else:
+            log.warning("Whisper failed (%s)", e)
+    if not heard and GEMINI_API_KEY and audio:
+        try:
+            heard = await gemini_transcribe(audio)
+        except Exception as e:
+            log.warning("Gemini transcription failed (%s)", e)
+    if not heard:
         heard = text_hint.strip()
     if not heard:
         return {"heard": "", "reply": "Sorry, I didn't catch that."}
@@ -4794,7 +4910,7 @@ class UltraVoice:
         text = " ".join((text or "").split())[:3000]
         if not text:
             return None
-        key = f"{TTS_VOICE}|{bool(OPENAI_API_KEY)}|{text}"
+        key = f"{TTS_VOICE}|{bool(OPENAI_API_KEY)}|{bool(GEMINI_API_KEY)}|{text}"
         if key in self.cache:
             return self.cache[key]
         audio = None
@@ -4803,6 +4919,11 @@ class UltraVoice:
                 audio = await self._openai(text)
             except Exception as e:
                 log.warning("OpenAI voice failed: %s", e)
+        if audio is None and GEMINI_API_KEY:
+            try:
+                audio = await gemini_speak(text)
+            except Exception as e:
+                log.warning("Gemini voice failed: %s", e)
         if audio is None:
             audio = await self._piper(text)
         if audio:
