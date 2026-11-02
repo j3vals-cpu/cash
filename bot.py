@@ -315,6 +315,7 @@ class TicketBot(discord.Client):
         self.loop.create_task(mod_stats.save_loop())
         self.loop.create_task(briefing_loop())
         self.loop.create_task(extras.timer_loop())
+        self.loop.create_task(ultra_voice.ensure())  # download Ultra's voice in the background
         # Public API for the website's live payout feed (needs Railway public networking)
         import web_api
         self.loop.create_task(web_api.start(self.payout_feed, office))
@@ -3431,6 +3432,9 @@ class OfficeData:
             st["state"] = "idle"  # never get stuck on screen
         return st
 
+    async def tts(self, text: str) -> bytes | None:
+        return await ultra_voice.speak(text)
+
     async def voice_command(self, audio: bytes, text: str = "") -> dict:
         return await handle_voice_command(audio, text)
 
@@ -4682,6 +4686,133 @@ async def jukebox_queue(interaction: discord.Interaction):
 bot.tree.add_command(jukebox_group)
 
 
+
+
+# --------------------------------------------------------------------------- #
+# Ultra's voice: natural text-to-speech made on the server (Piper neural voice, free; OpenAI voice if a key is set)
+# Used by the office screen on laptops/phones and by the Pi, so everything sounds the same.
+# --------------------------------------------------------------------------- #
+
+TTS_VOICE = os.getenv("TTS_VOICE", "en_GB-cori-high")          # any voice from huggingface.co/rhasspy/piper-voices
+OPENAI_TTS_VOICE = os.getenv("OPENAI_TTS_VOICE", "ash")
+OPENAI_TTS_STYLE = os.getenv("OPENAI_TTS_STYLE", "Speak naturally with a friendly, confident British accent, like a sharp office "
+                             "assistant. Warm, upbeat, clear and not too fast.")
+PIPER_DIR = os.path.join(DATA_DIR, "piper-server")
+PIPER_RELEASE = "https://github.com/rhasspy/piper/releases/download/2023.11.14-2/piper_linux_x86_64.tar.gz"
+
+
+class UltraVoice:
+    def __init__(self):
+        self.ready = False
+        self.lock = asyncio.Lock()
+        self.cache: dict[str, bytes] = {}
+
+    @property
+    def binary(self):
+        return os.path.join(PIPER_DIR, "piper", "piper")
+
+    @property
+    def model(self):
+        return os.path.join(PIPER_DIR, f"{TTS_VOICE}.onnx")
+
+    async def _download(self, url, path):
+        tmp = path + ".part"
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=600)) as s:
+            async with s.get(url) as r:
+                r.raise_for_status()
+                with open(tmp, "wb") as f:
+                    async for chunk in r.content.iter_chunked(1 << 16):
+                        f.write(chunk)
+        os.replace(tmp, path)
+
+    async def ensure(self) -> bool:
+        if self.ready:
+            return True
+        async with self.lock:
+            if self.ready:
+                return True
+            try:
+                os.makedirs(PIPER_DIR, exist_ok=True)
+                if not os.path.exists(self.binary):
+                    tar = os.path.join(PIPER_DIR, "piper.tar.gz")
+                    await self._download(PIPER_RELEASE, tar)
+                    import tarfile
+                    await asyncio.to_thread(lambda: tarfile.open(tar).extractall(PIPER_DIR))
+                    os.remove(tar)
+                if not os.path.exists(self.model):
+                    lang = TTS_VOICE.split("-")[0]                     # en_GB
+                    speaker, quality = TTS_VOICE.split("-")[1], TTS_VOICE.split("-")[2]
+                    base = (f"https://huggingface.co/rhasspy/piper-voices/resolve/main/"
+                            f"{lang.split('_')[0]}/{lang}/{speaker}/{quality}/{TTS_VOICE}.onnx")
+                    await self._download(base + ".json", self.model + ".json")
+                    await self._download(base, self.model)
+                self.ready = True
+                log.info("Ultra's voice ready (%s)", TTS_VOICE)
+            except Exception:
+                log.exception("Couldn't set up Ultra's voice")
+            return self.ready
+
+    async def _openai(self, text: str) -> bytes | None:
+        """Newest OpenAI voice with a British style; falls back to tts-1 if that model isn't available."""
+        attempts = [{"model": "gpt-4o-mini-tts", "voice": OPENAI_TTS_VOICE, "instructions": OPENAI_TTS_STYLE},
+                    {"model": "tts-1-hd", "voice": "fable"}]
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=90)) as s:
+            for body in attempts:
+                async with s.post("https://api.openai.com/v1/audio/speech",
+                                  headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+                                  json={**body, "input": text[:4000], "response_format": "wav"}) as r:
+                    if r.status == 200:
+                        return await r.read()
+                    log.warning("OpenAI voice (%s) HTTP %s: %s", body["model"], r.status, (await r.text())[:200])
+        return None
+
+    async def _piper(self, text: str) -> bytes | None:
+        if not await self.ensure():
+            return None
+        import tempfile
+        out = tempfile.mktemp(suffix=".wav")
+        env = {**os.environ, "LD_LIBRARY_PATH": os.path.dirname(self.binary)}
+        proc = await asyncio.create_subprocess_exec(
+            self.binary, "--model", self.model, "--output_file", out, "--sentence_silence", "0.3",
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
+            cwd=os.path.dirname(self.binary), env=env)
+        _, err = await asyncio.wait_for(proc.communicate(text.encode()), timeout=120)
+        try:
+            if proc.returncode != 0:
+                log.warning("Piper failed: %s", (err or b"")[-300:])
+                return None
+            with open(out, "rb") as f:
+                return f.read()
+        finally:
+            try:
+                os.remove(out)
+            except OSError:
+                pass
+
+    async def speak(self, text: str) -> bytes | None:
+        """WAV audio of Ultra saying `text` (cached, so several screens asking at once only make it once)."""
+        text = " ".join((text or "").split())[:3000]
+        if not text:
+            return None
+        key = f"{TTS_VOICE}|{bool(OPENAI_API_KEY)}|{text}"
+        if key in self.cache:
+            return self.cache[key]
+        audio = None
+        if OPENAI_API_KEY:
+            try:
+                audio = await self._openai(text)
+            except Exception as e:
+                log.warning("OpenAI voice failed: %s", e)
+        if audio is None:
+            audio = await self._piper(text)
+        if audio:
+            self.cache[key] = audio
+            while len(self.cache) > 30:
+                self.cache.pop(next(iter(self.cache)))
+        return audio
+
+
+ultra_voice = UltraVoice()
 
 
 @bot.event

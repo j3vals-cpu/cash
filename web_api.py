@@ -265,6 +265,19 @@ def make_app(feed, office=None) -> web.Application:
         office.set_voice_state(q.get("state", "idle"), q.get("text", ""), q.get("heard", ""))
         return web.json_response({"ok": True})
 
+    async def office_tts(request):  # Ultra's voice as a WAV (screen on laptops + the Pi)
+        if not _office_ok(request) or office is None:
+            return web.json_response({"error": "unauthorized"}, status=403)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        audio = await office.tts(str(body.get("text") or request.query.get("text") or ""))
+        if not audio:
+            return web.json_response({"error": "voice not ready"}, status=503)
+        return web.Response(body=audio, content_type="audio/wav", headers={"Cache-Control": "no-store"})
+
+    app.router.add_post("/office/tts", office_tts)
     app.router.add_post("/office/listen", office_listen)
     app.router.add_get("/office/state", office_state_get)
     app.router.add_post("/office/state", office_state_set)

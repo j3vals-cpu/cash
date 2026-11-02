@@ -476,12 +476,28 @@
   let flashing = false;
   // On a laptop/phone the page reads announcements out itself (Sound on). On the Pi the Pi's own voice does it.
   const ON_PI = Q.get("pi") === "1";
+  let speakChain = Promise.resolve();
   function speak(text) {
-    if (ON_PI || !soundOn || quiet || !("speechSynthesis" in window) || !text) return;
+    if (ON_PI || !soundOn || quiet || !text) return;
+    speakChain = speakChain.then(() => playVoice(text)).catch(() => {});
+  }
+  async function playVoice(text) {
+    try {  // Ultra's natural voice, made on the server
+      const r = await fetch("/office/tts?key=" + encodeURIComponent(KEY), { method: "POST",
+        headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text }) });
+      if (!r.ok) throw new Error(r.status);
+      const url = URL.createObjectURL(await r.blob()), a = new Audio(url);
+      await a.play();
+      await new Promise(res => { a.onended = res; a.onerror = res; });
+      URL.revokeObjectURL(url);
+    } catch (e) { browserSpeak(text); }
+  }
+  function browserSpeak(text) {  // backup only
+    if (!("speechSynthesis" in window)) return;
     try {
       const u = new SpeechSynthesisUtterance(text);
       const v = speechSynthesis.getVoices();
-      u.voice = v.find(x => /en-GB/i.test(x.lang) && /male|daniel|george|ryan/i.test(x.name)) || v.find(x => /en-GB/i.test(x.lang)) || v.find(x => /^en/i.test(x.lang)) || null;
+      u.voice = v.find(x => /en-GB/i.test(x.lang) && /natural|online/i.test(x.name)) || v.find(x => /en-GB/i.test(x.lang)) || v.find(x => /^en/i.test(x.lang)) || null;
       u.lang = "en-GB"; u.rate = 1.02;
       speechSynthesis.speak(u);
     } catch (e) {}

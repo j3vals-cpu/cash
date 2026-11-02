@@ -116,8 +116,28 @@ def say(text):
             pass
 
 
+def _server_voice(text) -> bool:
+    """Ultra's natural voice from the bot (OpenAI / server Piper). Returns False if it couldn't play."""
+    try:
+        base, key = conf()
+        req = urllib.request.Request(f"{base}/office/tts?{urllib.parse.urlencode({'key': key})}",
+                                     data=json.dumps({"text": text}).encode(), method="POST",
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=60) as r:
+            audio = r.read()
+        path = "/tmp/ultra-voice.wav"
+        with open(path, "wb") as f:
+            f.write(audio)
+        return subprocess.run(["aplay", "-q", path], check=False).returncode == 0
+    except Exception as e:
+        log("Server voice failed, using the local one:", e)
+        return False
+
+
 def _say(text):
     log("Saying:", text[:120])
+    if _server_voice(text):
+        return
     if os.path.exists(PIPER) and os.path.exists(VOICE):
         try:  # stream while it speaks, so long text starts straight away
             p1 = subprocess.Popen([PIPER, "--model", VOICE, "--output-raw", "--sentence_silence", "0.35"],
