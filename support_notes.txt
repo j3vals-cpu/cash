@@ -37,6 +37,7 @@ Payout currency, network & wallets:
 
 === Breaches & risk ===
 - Daily Loss: equity-based (includes unrealised losses and fees), resets 00:00 UTC. Allowance = Daily Loss % x the greater of Starting Trading Power or start-of-day balance.
+- Open positions at the daily reset: the new day's floor uses start-of-day BALANCE, which excludes open positions. Example: 100k account, open trade +$3k at 00:00 UTC, floor 94k -> floor stays 94k (does not move to 97k); equity (incl. the open trade) is checked against it, so open profit is extra room. The floor only rises once profit is closed into balance before a reset.
 - Max Drawdown: static from Starting Trading Power, never trails, doesn't reset.
 - The backend's full-precision numbers decide breaches, not rounded dashboard values.
 - Normal rule breaches can't be reversed and don't give refund rights.
