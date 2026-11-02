@@ -3397,7 +3397,7 @@ class OfficeData:
                 "birthdays_today": extras.birthdays_today(), "next_birthday": extras.next_birthday(),
                 "payouts": self._payouts(), "todo_payouts": self._todo_payouts(), "discord": self._discord(),
                 "vault": vault.summary(),
-                "announce": [i for i in voice.items[-5:] if i["kind"] in ("say", "shoutout", "timer", "ideas") and time.time() - i["ts"] < 900],
+                "announce": [i for i in voice.items[-5:] if i["kind"] in ("say", "shoutout", "timer", "ideas", "rundown") and time.time() - i["ts"] < 900],
                 "todos": [{"id": t["ts"], "text": t["text"], "by": t["by"]} for t in todos.open[:20]],
                 "mods_today": [{"name": mod_stats.names.get(uid, "Mod"), "count": s["c"], "active": fmt_dur(s["act"])}
                                for uid, s in mods[:5]],
@@ -3418,6 +3418,18 @@ class OfficeData:
     async def queue_rundown(self):
         text = await self.boot_summary()
         voice.add(text, "Office screen", kind="rundown")
+
+    voice_state = {"state": "idle", "text": "", "heard": "", "ts": 0}
+
+    def set_voice_state(self, state: str, text: str = "", heard: str = ""):
+        if state in ("idle", "listening", "thinking", "speaking"):
+            self.voice_state = {"state": state, "text": text[:600], "heard": heard[:300], "ts": int(time.time())}
+
+    def get_voice_state(self) -> dict:
+        st = dict(self.voice_state)
+        if st["state"] != "idle" and time.time() - st["ts"] > (90 if st["state"] == "speaking" else 30):
+            st["state"] = "idle"  # never get stuck on screen
+        return st
 
     async def voice_command(self, audio: bytes, text: str = "") -> dict:
         return await handle_voice_command(audio, text)

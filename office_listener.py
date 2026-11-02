@@ -117,6 +117,15 @@ def send(base, key, wav, text=""):
         return json.loads(r.read().decode())
 
 
+def state(base, key, st, text="", heard=""):
+    """Tell the screen what Ultra is doing (shows the listening / thinking graphic)."""
+    try:
+        q = urllib.parse.urlencode({"key": key, "state": st, "text": text[:500], "heard": heard[:300]})
+        urllib.request.urlopen(urllib.request.Request(f"{base}/office/state?{q}", data=b"", method="POST"), timeout=4).read()
+    except Exception:
+        pass
+
+
 def main():
     import urllib.parse  # noqa: F401  (used in send)
     from vosk import KaldiRecognizer, Model, SetLogLevel
@@ -146,21 +155,28 @@ def main():
         if any(w in heard for w in WAKE):
             rec.Reset()
             log("Wake word heard")
+            state(base, key, "listening")
             speaker.duck(True)  # music down so it can hear you
             beep()
             wav = record_command(proc, ambient)
             if not wav:
                 speaker.duck(False)
+                state(base, key, "idle")
                 continue
             try:
                 text = local_transcript(model, wav)
                 log("Heard (local):", text)
+                state(base, key, "thinking", heard=text)
                 d = send(base, key, wav, text)
                 log("Heard:", d.get("heard"), "| Reply:", d.get("reply"))
-                speaker.say(d.get("reply") or "Sorry, I didn't catch that.")
+                reply = d.get("reply") or "Sorry, I didn't catch that."
+                state(base, key, "speaking", reply, d.get("heard") or text)
+                speaker.say(reply)
             except Exception as e:
                 log("Send failed:", e)
+                state(base, key, "speaking", "Sorry, I couldn't reach the server.")
                 speaker.say("Sorry, I couldn't reach the server.")
+            state(base, key, "idle")
             # drop audio captured while we were talking
             proc.terminate(); proc = mic_stream(device); rec.Reset()
 

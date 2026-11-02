@@ -9,6 +9,7 @@ if [ -z "$URL" ]; then
   exit 1
 fi
 case "$URL" in *sound=*) ;; *) URL="$URL&sound=1" ;; esac   # payout chime on by default
+case "$URL" in *pi=1*) ;; *) URL="$URL&pi=1" ;; esac         # the Pi speaks with its own voice (not the browser)
 
 echo "== Installing the browser (this can take a few minutes)"
 sudo apt-get update -y

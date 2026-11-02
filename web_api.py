@@ -251,7 +251,23 @@ def make_app(feed, office=None) -> web.Application:
             log.exception("Voice command failed")
             return web.json_response({"heard": "", "reply": "Sorry, voice control isn't working right now."}, status=200)
 
+    async def office_state_get(request):  # the screen polls this every second for the "listening" graphic
+        if not _office_ok(request) or office is None:
+            return web.json_response({"error": "unauthorized"}, status=403)
+        resp = web.json_response(office.get_voice_state())
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
+
+    async def office_state_set(request):  # the Pi's listener reports listening / thinking / speaking / idle
+        if not _office_ok(request) or office is None:
+            return web.json_response({"error": "unauthorized"}, status=403)
+        q = request.query
+        office.set_voice_state(q.get("state", "idle"), q.get("text", ""), q.get("heard", ""))
+        return web.json_response({"ok": True})
+
     app.router.add_post("/office/listen", office_listen)
+    app.router.add_get("/office/state", office_state_get)
+    app.router.add_post("/office/state", office_state_set)
     # ---- Spotify: one-time login + music dimming while Ultra talks
     async def spotify_login(request):
         if not _office_ok(request) or office is None:

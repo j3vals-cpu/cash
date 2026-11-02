@@ -277,6 +277,44 @@
     .hours { gap: 4px; } .hr { padding: 4px 2px; }
     .cashed .kv, .mini .s { display: none; }
   }
+  /* ---- Ultra voice graphic ---- */
+  #voice { position: fixed; inset: 0; z-index: 20; display: none; flex-direction: column; align-items: center; justify-content: center;
+    background: radial-gradient(ellipse at 50% 40%, rgba(20,34,52,.97), rgba(5,5,6,.985) 60%); text-align: center; padding: 4vh 6vw; }
+  #voice.on { display: flex; animation: vin .25s ease-out; }
+  @keyframes vin { from { opacity: 0 } to { opacity: 1 } }
+  .orb { position: relative; width: clamp(140px, 22vh, 260px); height: clamp(140px, 22vh, 260px); }
+  .orb b { position: absolute; inset: 22%; border-radius: 50%;
+    background: radial-gradient(circle at 35% 30%, #E6F2FF, #8EC5FF 45%, #2E6FB8 100%);
+    box-shadow: 0 0 60px rgba(142,197,255,.55), inset 0 0 30px rgba(255,255,255,.25); animation: breathe 1.6s ease-in-out infinite; }
+  .orb i { position: absolute; inset: 22%; border-radius: 50%; border: 2px solid rgba(142,197,255,.55); animation: ring 1.8s ease-out infinite; }
+  .orb i:nth-child(2) { animation-delay: .6s; } .orb i:nth-child(3) { animation-delay: 1.2s; }
+  @keyframes ring { from { transform: scale(1); opacity: .9 } to { transform: scale(2.1); opacity: 0 } }
+  @keyframes breathe { 0%,100% { transform: scale(.94) } 50% { transform: scale(1.04) } }
+  #voice.thinking .orb i { animation: none; opacity: 0; }
+  #voice.thinking .orb b { animation: spin 1.1s linear infinite; background: conic-gradient(from 0deg, #2E6FB8, #8EC5FF, #E6F2FF, #8EC5FF, #2E6FB8); }
+  @keyframes spin { to { transform: rotate(360deg) } }
+  #voice.speaking .orb b { animation: talk .35s ease-in-out infinite alternate; }
+  #voice.speaking .orb i { animation-duration: 1.1s; }
+  @keyframes talk { from { transform: scale(.92) } to { transform: scale(1.06) } }
+  .vs { margin-top: 3.5vh; font-size: clamp(26px, 3.6vw, 64px); font-weight: 800; letter-spacing: -.02em; }
+  .vh { margin-top: 1.4vh; color: var(--muted); font-size: clamp(14px, 1.5vw, 26px); font-style: italic; max-width: 70vw; }
+  .vh:empty, .vr:empty { display: none; }
+  .vr { margin-top: 2.4vh; font-size: clamp(18px, 2.2vw, 40px); font-weight: 600; line-height: 1.3; max-width: 72vw; color: #e9ebee; }
+
+  /* ---- shorter screens (laptops): keep the right column from cutting off ---- */
+  @media (max-height: 950px) {
+    .clock .t { font-size: clamp(56px, 6.6vw, 140px); }
+    .clockcard { padding: clamp(10px, 1.6vh, 24px) 0; }
+    .np { margin-top: 8px; }
+    .idea .h { display: none; }
+    .ideas { gap: 8px; }
+    .pr:nth-child(n+4) { display: none; }
+    .cashed .kv span:nth-child(n+3):nth-child(-n+4) { display: none; }
+  }
+  @media (max-height: 760px) {
+    .pr:nth-child(n+3) { display: none; }
+    .nrr:nth-child(n+5) { display: none; }
+  }
   @media (prefers-reduced-motion: reduce) { * { animation: none !important; } }
 </style>
 </head>
@@ -352,6 +390,13 @@
   </section>
 </main>
 
+
+<div id="voice" aria-live="polite">
+  <div class="orb"><i></i><i></i><i></i><b></b></div>
+  <div class="vs" id="vState">Listening…</div>
+  <div class="vh" id="vHeard"></div>
+  <div class="vr" id="vReply"></div>
+</div>
 
 <div id="flash" role="alert">
   <div class="k" id="flashK">CASHED · NEW PAYOUT</div>
@@ -429,6 +474,18 @@
 
   // ---------- sound: cash register chime made in the browser
   let flashing = false;
+  // On a laptop/phone the page reads announcements out itself (Sound on). On the Pi the Pi's own voice does it.
+  const ON_PI = Q.get("pi") === "1";
+  function speak(text) {
+    if (ON_PI || !soundOn || quiet || !("speechSynthesis" in window) || !text) return;
+    try {
+      const u = new SpeechSynthesisUtterance(text);
+      const v = speechSynthesis.getVoices();
+      u.voice = v.find(x => /en-GB/i.test(x.lang) && /male|daniel|george|ryan/i.test(x.name)) || v.find(x => /en-GB/i.test(x.lang)) || v.find(x => /^en/i.test(x.lang)) || null;
+      u.lang = "en-GB"; u.rate = 1.02;
+      speechSynthesis.speak(u);
+    } catch (e) {}
+  }
   let audio = null, soundOn = Q.get("sound") === "1";
   try { const s = localStorage.getItem("officeSound"); if (s !== null) soundOn = s === "1"; } catch (e) {}
   const setSoundBtn = () => { $("soundBtn").textContent = soundOn ? "Sound on" : "Sound off"; $("soundBtn").classList.toggle("on", soundOn); };
@@ -618,7 +675,11 @@
     const A = d.announce || [];
     const freshA = seenAnn ? A.filter(a => !seenAnn.has(a.id)) : [];
     seenAnn = new Set([...(seenAnn || []), ...A.map(a => a.id)]);
-    freshA.forEach(a => flash({ announce: true, ...a }));
+    freshA.forEach(a => {
+      if (a.kind === "rundown") { chime(); speak(a.text); return; }  // rundown: read out, no pop-up
+      flash({ announce: true, ...a });
+      speak(a.kind === "say" ? "Announcement from " + a.by + ". " + a.text : a.text);
+    });
     if (T) {
       $("toPay").textContent = T.to_pay;
       $("toPaySub").innerHTML = usd.format(T.owed) + " owed" + (T.risk ? " · <span class='down'>" + T.risk + " risk</span>" : "");
@@ -657,6 +718,23 @@
     catch (e) { b.textContent = "Couldn't start"; }
     setTimeout(() => { b.disabled = false; b.textContent = "Play rundown"; }, 60000);
   });
+
+  // ---------- Ultra voice graphic (listening / thinking / speaking)
+  let vLast = "idle";
+  async function pollVoice() {
+    try {
+      const r = await fetch("/office/state?key=" + encodeURIComponent(KEY), { cache: "no-store" });
+      if (!r.ok) return;
+      const v = await r.json(), el = $("voice");
+      if (v.state === "idle") { el.classList.remove("on", "listening", "thinking", "speaking"); vLast = "idle"; return; }
+      el.classList.remove("listening", "thinking", "speaking"); el.classList.add("on", v.state);
+      $("vState").textContent = v.state === "listening" ? "Listening…" : v.state === "thinking" ? "Thinking…" : "Ultra";
+      $("vHeard").textContent = v.heard ? "\u201c" + v.heard + "\u201d" : "";
+      $("vReply").textContent = v.state === "speaking" ? (v.text || "") : "";
+      vLast = v.state;
+    } catch (e) {}
+  }
+  setInterval(pollVoice, 900);
 
   // ---------- data
   async function load() {
