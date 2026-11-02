@@ -305,6 +305,7 @@ class TicketBot(discord.Client):
         self.loop.create_task(mod_stats.save_loop())
         self.loop.create_task(briefing_loop())
         self.loop.create_task(extras.timer_loop())
+        self.loop.create_task(tag_rule_on_start())
         self.loop.create_task(ultra_voice.ensure())  # download Ultra's voice in the background
         # Public API for the website's live payout feed (needs Railway public networking)
         import web_api
@@ -2925,62 +2926,85 @@ bot.tree.add_command(mod_group)
 
 
 # --------------------------------------------------------------------------- #
-# /tag: ping people or roles by ID (for people who don't show up when you type @, or roles that can't be pinged)
+# /tag: protect people/roles from being @tagged in the Cashed server.
+# Uses Discord AutoMod: a message that tags a protected person is blocked, and only the sender
+# sees Discord's private "message blocked" notice with our text. Staff are exempt.
 # --------------------------------------------------------------------------- #
 
+TAG_RULE_NAME = "Cashed Bot: protected tags"
+TAG_DEFAULT_MSG = "Please don't tag staff directly. Open a ticket and the team will get back to you."
+
+
 class TagStore:
-    FILE = os.path.join(DATA_DIR, "tag_groups.json")
+    FILE = os.path.join(DATA_DIR, "protected_tags.json")
 
     def __init__(self):
-        self.groups: dict[str, list[int]] = {}
+        self.ids: list[int] = [436235833163644928, 1059872205909000233, 1351115065910362223]
+        self.message = TAG_DEFAULT_MSG
         try:
             with open(self.FILE, encoding="utf-8") as f:
-                self.groups = {k: [int(x) for x in v] for k, v in json.load(f).items()}
+                d = json.load(f)
+            self.ids = [int(x) for x in d.get("ids", [])]
+            self.message = d.get("message") or TAG_DEFAULT_MSG
         except FileNotFoundError:
-            # starter group: the two people + role you asked for (change with /tag save team ...)
-            self.groups = {"team": [436235833163644928, 1059872205909000233, 1351115065910362223]}
+            pass
         except Exception:
-            log.exception("Couldn't read tag groups")
+            log.exception("Couldn't read protected tags")
 
     def save(self):
         try:
             os.makedirs(DATA_DIR, exist_ok=True)
             tmp = self.FILE + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(self.groups, f)
+                json.dump({"ids": self.ids, "message": self.message}, f)
             os.replace(tmp, self.FILE)
         except Exception:
-            log.exception("Couldn't save tag groups")
+            log.exception("Couldn't save protected tags")
 
 
 tag_store = TagStore()
-tag_group = app_commands.Group(name="tag", description="Ping people or roles by ID, even if they can't be @tagged")
+tag_group = app_commands.Group(name="tag", description="Stop people tagging certain members or roles")
 
 
-def _parse_targets(text: str) -> list[int]:
-    """IDs from text: plain numbers, <@123>, <@!123>, <@&123>, or a saved group name."""
-    ids = []
-    for part in re.split(r"[\s,]+", (text or "").strip()):
-        if not part:
-            continue
-        name = part.lower()
-        if name in tag_store.groups:
-            ids += tag_store.groups[name]
-            continue
-        m = re.fullmatch(r"<@[!&]?(\d{15,21})>|(\d{15,21})", part)
-        if m:
-            ids.append(int(m.group(1) or m.group(2)))
-    out = []
-    for i in ids:
-        if i not in out:
-            out.append(i)
-    return out
+def _tag_patterns(ids: list[int]) -> list[str]:
+    # <@id>, <@!id> (user) and <@&id> (role); AutoMod allows 10 patterns of 260 chars each
+    pats = []
+    for i in range(0, len(ids), 10):
+        pats.append("<@[!&]?(?:" + "|".join(str(x) for x in ids[i:i + 10]) + ")>")
+    return pats[:10]
 
 
-def _mention(guild: discord.Guild | None, target_id: int) -> str:
-    if guild and guild.get_role(target_id):
-        return f"<@&{target_id}>"
-    return f"<@{target_id}>"
+async def apply_tag_rule(guild: discord.Guild) -> str | None:
+    """Create/update the AutoMod rule. Returns an error message, or None if it worked."""
+    try:
+        rules = await guild.fetch_automod_rules()
+    except discord.Forbidden:
+        return ("The bot needs the **Manage Server** permission to set this up. Turn it on for the Cashed Bot "
+                "role in Server Settings → Roles, then run `/tag list`.")
+    rule = next((r for r in rules if r.name == TAG_RULE_NAME), None)
+    exempt = [guild.get_role(r) for r in STAFF_ROLE_IDS]
+    exempt = [r for r in exempt if r is not None][:20]
+    try:
+        if not tag_store.ids:
+            if rule:
+                await rule.delete(reason="No protected tags left")
+            return None
+        trigger = discord.AutoModTrigger(type=discord.AutoModRuleTriggerType.keyword,
+                                         regex_patterns=_tag_patterns(tag_store.ids))
+        actions = [discord.AutoModRuleAction(custom_message=tag_store.message[:150])]
+        if rule:
+            await rule.edit(trigger=trigger, actions=actions, exempt_roles=exempt, enabled=True,
+                            reason="Protected tags updated")
+        else:
+            await guild.create_automod_rule(name=TAG_RULE_NAME, event_type=discord.AutoModRuleEventType.message_send,
+                                            trigger=trigger, actions=actions, enabled=True, exempt_roles=exempt,
+                                            reason="Protected tags set up")
+    except discord.Forbidden:
+        return "The bot needs the **Manage Server** permission (Server Settings → Roles → Cashed Bot)."
+    except discord.HTTPException as e:
+        log.exception("AutoMod rule failed")
+        return f"Discord refused the rule: {e.text or e}"
+    return None
 
 
 async def _tag_staff_ok(interaction: discord.Interaction) -> bool:
@@ -2990,82 +3014,81 @@ async def _tag_staff_ok(interaction: discord.Interaction) -> bool:
     return True
 
 
-async def _group_autocomplete(interaction: discord.Interaction, current: str):
-    return [app_commands.Choice(name=f"{n} ({len(v)})", value=n)
-            for n, v in sorted(tag_store.groups.items()) if current.lower() in n][:25]
+def _mention(guild, i: int) -> str:
+    return f"<@&{i}>" if guild and guild.get_role(i) else f"<@{i}>"
 
 
-@tag_group.command(name="send", description="Post a message that pings people/roles by ID or a saved group")
-@app_commands.describe(who="IDs (user or role), @mentions, or a saved group name - separate with spaces",
-                       message="What to say (optional)")
-@app_commands.autocomplete(who=_group_autocomplete)
-async def tag_send(interaction: discord.Interaction, who: str, message: str = ""):
+@tag_group.command(name="add", description="Stop members tagging this person or role (staff can still tag them)")
+@app_commands.describe(user="Person to protect", role="Or a role to protect")
+async def tag_add(interaction: discord.Interaction, user: discord.User = None, role: discord.Role = None):
     if not await _tag_staff_ok(interaction):
         return
-    ids = _parse_targets(who)
-    if not ids:
-        await interaction.response.send_message(
-            "I couldn't find any IDs or saved groups in that. Example: `436235833163644928 1351115065910362223`",
-            ephemeral=True)
+    target = user or role
+    if target is None:
+        await interaction.response.send_message("Pick a person or a role.", ephemeral=True)
         return
-    pings = " ".join(_mention(interaction.guild, i) for i in ids)
-    content = f"{pings}\n{message}".strip()[:2000]
-    await interaction.response.send_message("Sent.", ephemeral=True)
-    try:
-        await interaction.channel.send(content, allowed_mentions=discord.AllowedMentions(
-            users=True, roles=True, everyone=False))
-    except discord.Forbidden:
-        await interaction.followup.send("I can't post in this channel.", ephemeral=True)
-    roles_blocked = [i for i in ids if interaction.guild and (r := interaction.guild.get_role(i))
-                     and not r.mentionable and not interaction.guild.me.guild_permissions.mention_everyone]
-    if roles_blocked:
-        await interaction.followup.send(
-            "Heads up: a role in that list won't actually ping, because the bot doesn't have **Mention @everyone, "
-            "@here and All Roles**. Turn that on for the Cashed Bot role in Server Settings → Roles.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    if target.id not in tag_store.ids:
+        tag_store.ids.append(target.id)
+        tag_store.save()
+    err = await apply_tag_rule(interaction.guild)
+    await interaction.followup.send(err or f"{target.mention} is protected. Anyone (except staff) who tags them gets "
+                                           f"their message blocked with: *{tag_store.message}*",
+                                    ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
 
 
-@tag_group.command(name="save", description="Save a list of people/roles under a short name, e.g. 'team'")
-@app_commands.describe(name="Short name, e.g. team", who="IDs (user or role) or @mentions, separated by spaces")
-async def tag_save(interaction: discord.Interaction, name: str, who: str):
+@tag_group.command(name="remove", description="Let members tag this person or role again")
+async def tag_remove(interaction: discord.Interaction, user: discord.User = None, role: discord.Role = None):
     if not await _tag_staff_ok(interaction):
         return
-    name = re.sub(r"\s+", "-", name.strip().lower())[:30]
-    ids = [i for i in _parse_targets(who)]
-    if not name or not ids:
-        await interaction.response.send_message("Give a name and at least one ID.", ephemeral=True)
+    target = user or role
+    if target is None or target.id not in tag_store.ids:
+        await interaction.response.send_message("They're not on the protected list.", ephemeral=True)
         return
-    tag_store.groups[name] = ids
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    tag_store.ids.remove(target.id)
     tag_store.save()
-    await interaction.response.send_message(
-        f"Saved **{name}**: {' '.join(_mention(interaction.guild, i) for i in ids)}\n"
-        f"Use `/tag send who:{name} message:...`", ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+    err = await apply_tag_rule(interaction.guild)
+    await interaction.followup.send(err or f"{target.mention} can be tagged again.", ephemeral=True,
+                                    allowed_mentions=discord.AllowedMentions.none())
 
 
-@tag_group.command(name="list", description="Show saved tag groups")
+@tag_group.command(name="list", description="Who's protected from tags, and the message people see")
 async def tag_list(interaction: discord.Interaction):
     if not await _tag_staff_ok(interaction):
         return
-    if not tag_store.groups:
-        await interaction.response.send_message("No saved groups yet. Use `/tag save`.", ephemeral=True)
-        return
-    lines = [f"**{n}**: {' '.join(_mention(interaction.guild, i) for i in v)}" for n, v in sorted(tag_store.groups.items())]
-    await interaction.response.send_message("\n".join(lines)[:2000], ephemeral=True,
-                                            allowed_mentions=discord.AllowedMentions.none())
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    err = await apply_tag_rule(interaction.guild)  # also re-applies the rule
+    who = " ".join(_mention(interaction.guild, i) for i in tag_store.ids) or "nobody"
+    await interaction.followup.send(f"**Protected:** {who}\n**Message they see:** {tag_store.message}"
+                                    + (f"\n\n{err}" if err else ""), ephemeral=True,
+                                    allowed_mentions=discord.AllowedMentions.none())
 
 
-@tag_group.command(name="delete", description="Delete a saved tag group")
-@app_commands.autocomplete(name=_group_autocomplete)
-async def tag_delete(interaction: discord.Interaction, name: str):
+@tag_group.command(name="message", description="Change the private message people see when their tag is blocked")
+@app_commands.describe(text="Up to 150 characters")
+async def tag_message(interaction: discord.Interaction, text: app_commands.Range[str, 1, 150]):
     if not await _tag_staff_ok(interaction):
         return
-    if tag_store.groups.pop(name.strip().lower(), None) is None:
-        await interaction.response.send_message("No group with that name.", ephemeral=True)
-        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    tag_store.message = text
     tag_store.save()
-    await interaction.response.send_message(f"Deleted **{name}**.", ephemeral=True)
+    err = await apply_tag_rule(interaction.guild)
+    await interaction.followup.send(err or f"Updated. People now see: *{text}*", ephemeral=True)
 
 
 bot.tree.add_command(tag_group)
+
+
+async def tag_rule_on_start():
+    await bot.wait_until_ready()
+    if not GUILD_ID:
+        return
+    guild = bot.get_guild(int(GUILD_ID))
+    if guild:
+        err = await apply_tag_rule(guild)
+        if err:
+            log.warning("Protected tags not active: %s", err)
 
 
 # --------------------------------------------------------------------------- #
