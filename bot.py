@@ -4231,7 +4231,7 @@ async def office_timer(interaction: discord.Interaction, minutes: float = None, 
 
 @office_group.command(name="quiet", description="Mute chimes and spoken announcements for a while")
 @app_commands.describe(minutes="How long (0 turns quiet mode off)")
-async def office_quiet(interaction: discord.Interaction, minutes: float = 60):
+async def office_quiet(interaction: discord.Interaction, minutes: float = 60.0):
     if not office_allowed(interaction):
         return await interaction.response.send_message("This command is for staff only.", ephemeral=True)
     extras.set_quiet(minutes)
