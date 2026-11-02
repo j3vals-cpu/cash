@@ -31,7 +31,23 @@ PIPER = os.path.join(HOME, "piper", "piper")
 VOICE = os.path.join(HOME, "piper", "voice.onnx")
 CHIME = os.path.join(HOME, ".cashed-chime.wav")
 SPEAK_FROM, SPEAK_TO = 6, 21   # only read the rundown during these hours
-COOLDOWN = 3 * 3600            # don't repeat the rundown if the TV is switched off and on again within 3 hours
+RUNDOWN_DAY = os.path.join(HOME, ".cashed-rundown-day")  # the rundown plays once a day (first time the TV goes on)
+
+
+def rundown_done_today() -> bool:
+    try:
+        with open(RUNDOWN_DAY) as f:
+            return f.read().strip() == datetime.now().strftime("%Y-%m-%d")
+    except OSError:
+        return False
+
+
+def mark_rundown_done():
+    try:
+        with open(RUNDOWN_DAY, "w") as f:
+            f.write(datetime.now().strftime("%Y-%m-%d"))
+    except OSError:
+        pass
 
 
 def log(*a):
@@ -200,7 +216,7 @@ def main():
     make_chime()
     if not wait_for_network(base, key):
         log("No connection to the bot - will keep trying")
-    last, was_on, last_rundown = -1, None, 0.0
+    last, was_on = -1, None
     next_check = 0.0
     while True:
         # 1) TV turned on -> rundown
@@ -216,13 +232,15 @@ def main():
                 was_on = True
             elif on and was_on is not True:  # just turned on (or already on when the Pi started)
                 hour = datetime.now().hour
-                if SPEAK_FROM <= hour < SPEAK_TO and time.time() - last_rundown > COOLDOWN:
+                if rundown_done_today():
+                    log("Screen turned on - rundown already played today, staying quiet")
+                elif SPEAK_FROM <= hour < SPEAK_TO:
                     log("Screen turned on - reading the rundown")
                     try:
                         time.sleep(6)  # give the TV a moment to wake its speakers
                         text = get(base, key, "/office/rundown")["text"]
+                        mark_rundown_done()  # mark first, so a crash mid-way doesn't repeat it
                         chime(); say(text)
-                        last_rundown = time.time()
                     except Exception as e:
                         log("Rundown failed:", e)
             if on is not None:
@@ -242,7 +260,7 @@ def main():
                     chime()
                     say(("Announcement from " + item["by"] + ". " if item["kind"] == "say" else "") + item["text"])
                     if item["kind"] == "rundown":
-                        last_rundown = time.time()
+                        mark_rundown_done()
             last = d["last"]
         except Exception as e:
             log("Poll failed:", e)
