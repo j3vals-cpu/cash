@@ -291,20 +291,10 @@ class TicketBot(discord.Client):
             cmd.default_permissions = discord.Permissions(administrator=True)
             cmd.guild_only = True
         if GUILD_ID:
-            guild = discord.Object(id=int(GUILD_ID))
-            self.tree.copy_global_to(guild=guild)
-            await self.tree.sync(guild=guild)
-            # Cashed commands live only in the Cashed server: wipe any old copies published to every server,
-            # so the office server doesn't show Cashed commands (and Cashed never shows office ones)
-            self.tree.clear_commands(guild=None)
-            await self.tree.sync()
-        else:
-            await self.tree.sync()
-        if OFFICE_GUILD_ID:
-            try:
-                await self.tree.sync(guild=og)
-            except Exception:
-                log.exception("Couldn't add commands to the office server - is the bot in it?")
+            self.tree.copy_global_to(guild=discord.Object(id=int(GUILD_ID)))
+        # Command syncing runs in the background so a Discord rate limit can never stop the website/office screen
+        # from starting; it's skipped when the commands haven't changed since the last deploy.
+        self.loop.create_task(self.sync_commands(og if OFFICE_GUILD_ID else None))
         self.add_dynamic_items(CheckPaymentButton, OpenTicketButton, VerifyButton, CloseTicketButton)  # 'Check payment' buttons keep working after restarts
         # Live payout feed runs in the background alongside the commands
         self.payout_feed = PayoutFeed(self)
@@ -319,6 +309,47 @@ class TicketBot(discord.Client):
         # Public API for the website's live payout feed (needs Railway public networking)
         import web_api
         self.loop.create_task(web_api.start(self.payout_feed, office))
+
+    def _commands_signature(self, guild_ids) -> str:
+        import hashlib
+        parts = []
+        for gid in [None] + list(guild_ids):
+            g = discord.Object(id=gid) if gid else None
+            for c in sorted(self.tree.get_commands(guild=g), key=lambda c: c.name):
+                try:
+                    parts.append(json.dumps(c.to_dict(self.tree), sort_keys=True, default=str))
+                except Exception:
+                    parts.append(f"{gid}:{c.name}:{time.time()}")  # can't fingerprint -> always sync
+        return hashlib.sha256("\n".join(parts).encode()).hexdigest()
+
+    async def sync_commands(self, og):
+        sig_file = os.path.join(DATA_DIR, "commands_synced.txt")
+        gids = [g for g in (int(GUILD_ID) if GUILD_ID else 0, OFFICE_GUILD_ID) if g]
+        try:
+            sig = self._commands_signature(gids)
+            try:
+                with open(sig_file) as f:
+                    if f.read().strip() == sig:
+                        log.info("Slash commands unchanged - skipping sync")
+                        return
+            except OSError:
+                pass
+            if GUILD_ID:
+                await asyncio.wait_for(self.tree.sync(guild=discord.Object(id=int(GUILD_ID))), 120)
+                # Cashed commands live only in the Cashed server: wipe old copies published to every server
+                self.tree.clear_commands(guild=None)
+            await asyncio.wait_for(self.tree.sync(), 120)
+            if og is not None:
+                try:
+                    await asyncio.wait_for(self.tree.sync(guild=og), 120)
+                except Exception:
+                    log.exception("Couldn't add commands to the office server - is the bot in it?")
+            os.makedirs(DATA_DIR, exist_ok=True)
+            with open(sig_file, "w") as f:
+                f.write(sig)
+            log.info("Slash commands synced")
+        except Exception:
+            log.exception("Slash command sync failed (commands keep their last version; will retry next deploy)")
 
 
 bot = TicketBot()
