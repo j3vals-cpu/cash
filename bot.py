@@ -295,7 +295,7 @@ class TicketBot(discord.Client):
         # Command syncing runs in the background so a Discord rate limit can never stop the website/office screen
         # from starting; it's skipped when the commands haven't changed since the last deploy.
         self.loop.create_task(self.sync_commands(og if OFFICE_GUILD_ID else None))
-        self.add_dynamic_items(CheckPaymentButton, OpenTicketButton, VerifyButton, CloseTicketButton)  # 'Check payment' buttons keep working after restarts
+        self.add_dynamic_items(CheckPaymentButton, OpenTicketButton, PayoutBugButton, VerifyButton, CloseTicketButton)  # 'Check payment' buttons keep working after restarts
         # Live payout feed runs in the background alongside the commands
         self.payout_feed = PayoutFeed(self)
         self.loop.create_task(self.payout_feed.run())
@@ -2378,8 +2378,10 @@ def not_verified_msg() -> str:
             f"<{CASHED_LINK_URL}>\nOnce it's linked, press **Verify** and you'll be able to open a payout ticket.")
 
 
-def open_ticket_of(guild, user_id):
-    return next((c for c in guild.text_channels if our_ticket(c) and f"uid:{user_id}" in (c.topic or "")), None)
+def open_ticket_of(guild, user_id, kind: str = "Payout ticket"):
+    return next((c for c in guild.text_channels if our_ticket(c) and f"uid:{user_id}" in (c.topic or "")
+                 and (f"· {kind} ·" in (c.topic or "") or (kind == "Payout ticket" and "· Payout bug ·" not in (c.topic or "")))),
+                None)
 
 
 def slug(text: str) -> str:
@@ -2497,6 +2499,98 @@ class PayoutForm(discord.ui.Modal, title="Payout request"):
         await ch.send("\n".join(lines)[:2000], view=close_view(),
                       allowed_mentions=discord.AllowedMentions.none())
         await interaction.followup.send(f"Your payout ticket is open: {ch.mention}", ephemeral=True)
+
+
+class PayoutBugForm(discord.ui.Modal, title="Report a payout bug"):
+    def __init__(self, category_id: int, info: dict | None):
+        super().__init__(timeout=900)
+        self.category_id, self.info = category_id, info or {}
+        self.username = discord.ui.TextInput(label="Cashed username", max_length=60,
+                                             default=(self.info.get("username") or None))
+        self.email = discord.ui.TextInput(label="Cashed email", max_length=120,
+                                          default=(self.info.get("email") or None))
+        self.payout = discord.ui.TextInput(label="Payout ID or amount", placeholder="e.g. CSH-1792… or $1,500",
+                                           max_length=80)
+        self.problem = discord.ui.TextInput(label="What went wrong?", style=discord.TextStyle.paragraph,
+                                            placeholder="e.g. payout stuck on pending, wrong amount, not received, "
+                                                        "button not working", max_length=1000)
+        self.extra = discord.ui.TextInput(label="Wallet or transaction hash (optional)", required=False,
+                                          max_length=150)
+        for f in (self.username, self.email, self.payout, self.problem, self.extra):
+            self.add_item(f)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        guild, user = interaction.guild, interaction.user
+        existing = open_ticket_of(guild, user.id, "Payout bug")
+        if existing:
+            await interaction.followup.send(f"You already have an open payout bug ticket: {existing.mention}",
+                                            ephemeral=True)
+            return
+        cat = guild.get_channel(self.category_id)
+        if not isinstance(cat, discord.CategoryChannel):
+            await interaction.followup.send("Tickets aren't set up properly. Please contact support.", ephemeral=True)
+            return
+        overwrites = dict(cat.overwrites)
+        overwrites[guild.default_role] = discord.PermissionOverwrite(view_channel=False)
+        overwrites[user] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True,
+                                                       attach_files=True, embed_links=True)
+        for rid in STAFF_ROLE_IDS:
+            role = guild.get_role(rid)
+            if role:
+                overwrites[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True,
+                                                               read_message_history=True, attach_files=True,
+                                                               manage_messages=True)
+        overwrites[guild.me] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True,
+                                                           manage_channels=True, embed_links=True, attach_files=True)
+        name = f"bug-{slug(self.username.value) or slug(user.name) or user.id}"
+        try:
+            ch = await guild.create_text_channel(name, category=cat, overwrites=overwrites,
+                                                 topic=f"{TICKET_TOPIC_MARK} · Payout bug · uid:{user.id}",
+                                                 reason=f"Payout bug ticket for {user}")
+        except discord.HTTPException:
+            log.exception("Couldn't create payout bug ticket")
+            await interaction.followup.send("Couldn't open a ticket. Please try again later or contact support.",
+                                            ephemeral=True)
+            return
+        linked = self.info.get("linked")
+        e = discord.Embed(title="Payout bug report", colour=0xDC2626, timestamp=datetime.now(timezone.utc))
+        e.add_field(name="User", value=clean(self.username.value, 60) + (" (linked account)" if linked else ""), inline=True)
+        e.add_field(name="Email", value=clean(self.email.value, 120) or "-", inline=True)
+        e.add_field(name="Payout", value=clean(self.payout.value, 80) or "-", inline=True)
+        e.add_field(name="What went wrong", value=(self.problem.value or "-").strip()[:1024], inline=False)
+        if (self.extra.value or "").strip():
+            e.add_field(name="Wallet / transaction", value=f"`{clean(self.extra.value, 150)}`", inline=False)
+        if linked and self.info.get("username") and self.info["username"].lower() != self.username.value.strip().lower():
+            e.set_footer(text=f"Linked Cashed account is {self.info['username']}")
+        await ch.send(f"{user.mention} thanks for reporting this. Please add any screenshots here and our team will "
+                      f"look into it.", allowed_mentions=discord.AllowedMentions(users=[user]))
+        await ch.send(embed=e, view=close_view(), allowed_mentions=discord.AllowedMentions.none())
+        await interaction.followup.send(f"Your payout bug ticket is open: {ch.mention}", ephemeral=True)
+
+
+class PayoutBugButton(discord.ui.DynamicItem[discord.ui.Button], template=r"cashed:bug:(?P<cat>\d+)"):
+    """'Payout bug' on the panel: opens a ticket for payout problems (stuck, wrong amount, not received)."""
+
+    def __init__(self, category_id: int):
+        super().__init__(discord.ui.Button(label="Payout bug", style=discord.ButtonStyle.danger,
+                                           custom_id=f"cashed:bug:{category_id}"))
+        self.category_id = category_id
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls(int(match["cat"]))
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.guild is None:
+            return
+        existing = open_ticket_of(interaction.guild, interaction.user.id, "Payout bug")
+        if existing:
+            await interaction.response.send_message(f"You already have an open payout bug ticket: {existing.mention}",
+                                                    ephemeral=True)
+            return
+        info = await cashed_lookup(interaction.user.id)
+        await interaction.response.send_modal(PayoutBugForm(self.category_id, info if info and info.get("linked") else None))
 
 
 class OpenTicketButton(discord.ui.DynamicItem[discord.ui.Button], template=r"cashed:open:(?P<cat>\d+)"):
@@ -2635,10 +2729,12 @@ async def panel(interaction: discord.Interaction, category: discord.CategoryChan
             f"1. Link your Discord to your Cashed account in your dashboard: {CASHED_LINK_URL}\n"
             "2. Press **Verify** to get the Verified role\n"
             "3. Press **Open payout ticket** and fill in the form\n\n"
+            "Problem with a payout you already requested (stuck, wrong amount, not received)? Press **Payout bug**.\n\n"
             "Only verified accounts can open payout tickets. Make sure your wallet address and network are correct."),
         colour=0x16A34A)
     v = discord.ui.View(timeout=None)
     v.add_item(OpenTicketButton(category.id))
+    v.add_item(PayoutBugButton(category.id))
     v.add_item(VerifyButton())
     v.add_item(discord.ui.Button(label="Link account", style=discord.ButtonStyle.link, url=CASHED_LINK_URL))
     await interaction.channel.send(embed=e, view=v)
