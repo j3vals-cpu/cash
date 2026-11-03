@@ -2243,6 +2243,32 @@ async def risk_log(embed):
         log.exception("Couldn't write to the risk log channel")
 
 
+async def hedge_ticket(ch, cat, reason: str, by) -> tuple[bool, list, str | None]:
+    """Flag the ticket's wallets, quietly move it to the risk category and log it. Returns (moved, wallets, error)."""
+    info = await read_ticket_for_ledger(ch, use_ai=False)
+    wallets = list(dict.fromkeys(info["wallets"] + [p["wallet"] for p in tracker.by_ticket().get(ch.id, [])]))
+    now = int(time.time())
+    entry = {"reason": reason, "by": by.id, "ts": now, "ticket": ch.id, "name": ch.name}
+    risk.flag(wallets, entry)
+    moved = ch.category_id != HEDGE_CATEGORY_ID
+    if moved:
+        risk.tickets[str(ch.id)] = {**entry, "orig_category": ch.category_id}
+        try:
+            # keep the ticket's own permissions so the trader notices nothing
+            await ch.edit(category=cat, sync_permissions=False, reason="Risk review")
+        except Exception as e:
+            risk.save()
+            return False, wallets, f"Flagged the wallet(s), but couldn't move the ticket: {e}"
+    risk.save()
+    e = discord.Embed(title=f"HEDGE FLAG · #{ch.name}", colour=0xDC2626, timestamp=datetime.now(timezone.utc))
+    e.add_field(name="Ticket", value=f"<#{ch.id}>", inline=True)
+    e.add_field(name="Flagged by", value=by.mention, inline=True)
+    e.add_field(name="Reason", value=(reason or "not given")[:1024], inline=False)
+    e.add_field(name="Wallets", value="\n".join(f"`{w}`" for w in wallets[:10]) or "none posted yet", inline=False)
+    await risk_log(e)
+    return moved, wallets, None
+
+
 @bot.tree.command(name="hedge", description="Quietly flag this trader for the risk team (they won't see anything)")
 @app_commands.describe(reason="Why you suspect them (only staff see this)")
 async def hedge(interaction: discord.Interaction, reason: str = ""):
@@ -2260,31 +2286,10 @@ async def hedge(interaction: discord.Interaction, reason: str = ""):
         return
     await interaction.response.defer(ephemeral=True, thinking=True)
 
-    info = await read_ticket_for_ledger(ch, use_ai=False)
-    wallets = list(dict.fromkeys(info["wallets"] + [p["wallet"] for p in tracker.by_ticket().get(ch.id, [])]))
-    now = int(time.time())
-    entry = {"reason": reason, "by": interaction.user.id, "ts": now, "ticket": ch.id, "name": ch.name}
-    risk.flag(wallets, entry)
-
-    moved = ch.category_id != HEDGE_CATEGORY_ID
-    if moved:
-        risk.tickets[str(ch.id)] = {**entry, "orig_category": ch.category_id}
-        try:
-            # keep the ticket's own permissions so the trader notices nothing
-            await ch.edit(category=cat, sync_permissions=False, reason="Risk review")
-        except Exception as e:
-            risk.save()
-            await interaction.followup.send(f"Flagged the wallet(s), but couldn't move the ticket: {e}",
-                                            ephemeral=True)
-            return
-    risk.save()
-
-    e = discord.Embed(title=f"HEDGE FLAG · #{ch.name}", colour=0xDC2626, timestamp=datetime.now(timezone.utc))
-    e.add_field(name="Ticket", value=f"<#{ch.id}>", inline=True)
-    e.add_field(name="Flagged by", value=interaction.user.mention, inline=True)
-    e.add_field(name="Reason", value=reason or "not given", inline=False)
-    e.add_field(name="Wallets", value="\n".join(f"`{w}`" for w in wallets[:10]) or "none posted yet", inline=False)
-    await risk_log(e)
+    moved, wallets, err = await hedge_ticket(ch, cat, reason, interaction.user)
+    if err:
+        await interaction.followup.send(err, ephemeral=True)
+        return
 
     text = (f"Flagged quietly. {'Moved the ticket to the risk category. ' if moved else 'Ticket was already in the risk category. '}"
             f"{len(wallets)} wallet(s) flagged - staff will see a warning on /payout, /find and /check for them.\n"
@@ -2720,6 +2725,185 @@ def close_view() -> discord.ui.View:
 @bot.tree.command(name="close", description="Save the transcript and close this payout ticket")
 async def close_cmd(interaction: discord.Interaction):
     await ask_close(interaction, interaction.channel)
+
+
+# --------------------------------------------------------------------------- #
+# /hedgescan: find open tickets from traders on the hedging watchlist (from the risk investigation)
+# and flag them like /hedge. Matches the Cashed username against the ticket name, the payout form,
+# and the ticket opener's Discord names. Shows a preview first; nothing moves until you confirm.
+# --------------------------------------------------------------------------- #
+
+HEDGE_WATCH_FILE = os.path.join(DATA_DIR, "hedge_watchlist.json")
+# From the internal evidence review (2 Nov 2026): username -> why
+HEDGE_WATCHLIST_DEFAULT = {
+    "posiii": "Rule 98 opposite accounts (TIA, TRX) - H01557, H01562",
+    "glitchin0": "Rule 98 opposite accounts (BTC) - H00350, H00352, H00371",
+    "maomaoyu": "Rule 98 opposite accounts (ETH) - H01183",
+    "shehzadalam0333": "Rule 98 opposite accounts (XYZ:GOLD) - H01429",
+    "ariszxyn": "Rule 98 opposite accounts (BTC) - H00005, H00016",
+    "bright": "Rule 98 opposite accounts (XYZ:GOLD) - H01415",
+    "cocoloco1987": "Rule 98 opposite accounts (BTC) - H00950",
+    "elies909": "Rule 98 (ETH) H01199-H01201; Rules 100-101 with ashraful (HYPE)",
+    "goku364747": "Rule 98 (BTC) H00672; Rules 100-101 with sidneycrosby, zymoney (BTC)",
+    "goru": "Rule 98 opposite accounts (prediction: Bitcoin above 81,200) - H01572",
+    "omega": "Rule 98 opposite accounts (SOL) - H01222",
+    "paimon26": "Rule 98 opposite accounts (PUMP) - H01530",
+    "reivouz": "Rule 98 opposite accounts (ZEC) - H01443, H01476",
+    "rks": "Rule 98 opposite accounts (BTC) - H00281",
+    "geeta": "Rules 100-101 with NEX (BTC, PARA:PAPER) - HT00093-HT00096",
+    "nex": "Rules 100-101 with Geeta (BTC, PARA:PAPER) - HT00093-HT00096",
+    "ashraful": "Rules 100-101 with elies909 (HYPE) - H01133-H01142",
+    "berlin": "Rules 100-101 with berlin66891 (BTC, predictions) - H01001, HT00412-414, H01573",
+    "berlin66891": "Rules 100-101 with berlin (BTC, predictions) - H01001, HT00412-414, H01573",
+    "faith": "Rules 100-101 with king_tonka1 (SOL) - H01257, H01267, H01270",
+    "king_tonka1": "Rules 100-101 with faith (SOL) - H01257, H01267, H01270",
+    "sidneycrosby": "Rules 100-101 with goku364747, shahzib (BTC)",
+    "zymoney": "Rules 100-101 with goku364747, napol (BTC)",
+    "napol": "Rules 100-101 with zymoney (BTC) - H00087, H00088, HT00056",
+    "r4vsilvz": "Rules 100-101 with sadu23ni (BTC) - H00046",
+    "sadu23ni": "Rules 100-101 with r4vsilvz (BTC) - H00046",
+    "rempo": "Rules 100-101 with yungthug (ZEC) - H01503",
+    "yungthug": "Rules 100-101 with rempo (ZEC) - H01503",
+    "shahzib": "Rules 100-101 with sidneycrosby (BTC) - H00117, H00264-H00324",
+}
+
+
+def load_hedge_watchlist() -> dict:
+    try:
+        with open(HEDGE_WATCH_FILE, encoding="utf-8") as f:
+            return {k.lower(): v for k, v in json.load(f).items()}
+    except Exception:
+        return dict(HEDGE_WATCHLIST_DEFAULT)
+
+
+def save_hedge_watchlist(d: dict):
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(HEDGE_WATCH_FILE, "w", encoding="utf-8") as f:
+        json.dump(d, f)
+
+
+def _name_tokens(text: str) -> set[str]:
+    """Whole-word name pieces: 'pg-payout-wasifbutt0578_77763' -> {'pg','payout','wasifbutt0578_77763','wasifbutt0578',...}"""
+    text = (text or "").lower()
+    toks = set(re.findall(r"[a-z0-9_.]+", text))
+    for t in list(toks):
+        toks.update(x for x in re.split(r"[_.]", t) if x)
+    return toks
+
+
+async def hedge_matches(guild: discord.Guild, watch: dict) -> list[dict]:
+    names = set(watch)
+    found = []
+    sem = asyncio.Semaphore(5)
+
+    async def check(ch):
+        why = []
+        if names & _name_tokens(base_name(ch.name)):
+            why.append(("ticket name", sorted(names & _name_tokens(base_name(ch.name)))))
+        uid = re.search(r"uid:(\d+)", ch.topic or "")
+        opener = None
+        async with sem:
+            try:
+                async for m in ch.history(limit=30, oldest_first=True):
+                    if opener is None and not m.author.bot:
+                        opener = m.author
+                    text = m.content or ""
+                    for e in m.embeds:
+                        text += " " + (e.description or "") + " " + " ".join(f"{f.name} {f.value}" for f in e.fields)
+                    for line in re.findall(r"(?i)\b(?:user(?:name)?|account)\b[\s*:_\-]{1,8}@?([A-Za-z0-9_.]{2,40})", text):
+                        if line.lower() in names:
+                            why.append(("payout form", [line.lower()]))
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+            member = None
+            if uid:
+                try:
+                    member = guild.get_member(int(uid.group(1))) or await guild.fetch_member(int(uid.group(1)))
+                except discord.HTTPException:
+                    member = None
+            member = member or opener
+            if member is not None:
+                disc = {(getattr(member, a, None) or "").lower() for a in ("name", "global_name", "display_name", "nick")}
+                hit = sorted(n for n in names if n in disc)
+                if hit:
+                    why.append(("Discord name", hit))
+        if why:
+            users = sorted({u for _, us in why for u in us})
+            found.append({"ch": ch, "users": users, "how": sorted({w for w, _ in why}),
+                          "opener": member.mention if member is not None else "?"})
+
+    chans = [c for c in guild.text_channels if is_ticket_channel(c) and c.category_id != HEDGE_CATEGORY_ID]
+    await asyncio.gather(*(check(c) for c in chans))
+    found.sort(key=lambda f: f["ch"].name)
+    return found
+
+
+class HedgeScanView(discord.ui.View):
+    def __init__(self, user_id: int, matches: list[dict], watch: dict):
+        super().__init__(timeout=900)
+        self.user_id, self.matches, self.watch = user_id, matches, watch
+
+    async def interaction_check(self, interaction):
+        return interaction.user.id == self.user_id
+
+    @discord.ui.button(label="Hedge all of these", style=discord.ButtonStyle.danger)
+    async def go(self, interaction: discord.Interaction, button: discord.ui.Button):
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(view=self)
+        cat = interaction.guild.get_channel(HEDGE_CATEGORY_ID)
+        if cat is None:
+            await interaction.followup.send("I can't find the risk category - check `HEDGE_CATEGORY_ID`.", ephemeral=True)
+            return
+        done, failed = [], []
+        for m in self.matches:
+            reason = "Hedging watchlist: " + "; ".join(f"@{u}: {self.watch.get(u, '')}" for u in m["users"])
+            moved, wallets, err = await hedge_ticket(m["ch"], cat, reason[:900], interaction.user)
+            (failed if err else done).append(f"<#{m['ch'].id}>" + (f" ({err})" if err else ""))
+            await asyncio.sleep(1)
+        await interaction.followup.send(f"Hedged **{len(done)}** ticket(s) quietly." +
+                                        (f"\nCouldn't move: {', '.join(failed)}" if failed else "") +
+                                        "\nUse **/unhedge** inside a ticket to undo one.", ephemeral=True)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(content="Cancelled. Nothing was changed.", view=self)
+
+
+@bot.tree.command(name="hedgescan", description="Find open tickets from traders on the hedging watchlist and flag them")
+@app_commands.describe(add="Usernames to add to the watchlist (space separated)",
+                       remove="Usernames to remove from the watchlist (space separated)")
+async def hedgescan(interaction: discord.Interaction, add: str = "", remove: str = ""):
+    if STAFF_ROLE_IDS and not is_staff(interaction.user):
+        await interaction.response.send_message("This command is for staff only.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    watch = load_hedge_watchlist()
+    changed = False
+    for u in re.split(r"[\s,]+", add.strip()):
+        if u:
+            watch[u.lstrip("@").lower()] = watch.get(u.lstrip("@").lower()) or f"added by {interaction.user}"
+            changed = True
+    for u in re.split(r"[\s,]+", remove.strip()):
+        if u and watch.pop(u.lstrip("@").lower(), None) is not None:
+            changed = True
+    if changed:
+        save_hedge_watchlist(watch)
+    matches = await hedge_matches(interaction.guild, watch)
+    head = f"**Hedging watchlist:** {len(watch)} usernames" + (" (updated)" if changed else "")
+    if not matches:
+        await interaction.followup.send(head + "\nNo open tickets match anyone on the list.", ephemeral=True)
+        return
+    lines = [f"<#{m['ch'].id}> · **@{', @'.join(m['users'])}** · matched by {', '.join(m['how'])} · opened by {m['opener']}"
+             for m in matches]
+    embeds = _chunks(f"{len(matches)} open ticket(s) match the hedging watchlist", lines, 0xDC2626)
+    embeds[-1].set_footer(text="Check the matches, then press Hedge all to move them to the risk category quietly.")
+    await interaction.followup.send(head + "\nMatched on Cashed username (ticket name or payout form) or the opener's "
+                                    "Discord name. A Discord-name-only match can be a different person, so check those.",
+                                    embeds=embeds[:10], view=HedgeScanView(interaction.user.id, matches, watch),
+                                    ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
 
 
 @bot.tree.command(name="panel", description="Post the 'Open payout ticket' panel in this channel")
