@@ -2767,19 +2767,139 @@ HEDGE_WATCHLIST_DEFAULT = {
     "shahzib": "Rules 100-101 with sidneycrosby (BTC) - H00117, H00264-H00324",
 }
 
+HEDGE_KEYS_DEFAULT = {  # account IDs and Cashed user IDs from the evidence review -> username
+    "cmrgg3e3x05z2l504t20ogl9k": "ariszxyn",
+    "csh-1783819646476-666": "ariszxyn",
+    "csh-1783868133619-273": "ariszxyn",
+    "csh-1784095323809-161": "ariszxyn",
+    "cmuzlc0nb0060l606ollkum7p": "ashraful",
+    "csh-f-1791991359450-a4f88b3c": "ashraful",
+    "cmvpn179e0000mq02u7nb35fm": "berlin",
+    "csh-1793043459937-c04b7243": "berlin",
+    "csh-1793044842213-9d07d6c0": "berlin",
+    "csh-1793255399131-63616b8b": "berlin",
+    "cmvpn3zl211bljp08i1chy4yj": "berlin66891",
+    "csh-1793045321746-5060a28f": "berlin66891",
+    "csh-1793047664996-c32e0a50": "berlin66891",
+    "csh-1793255413359-71c7f3f8": "berlin66891",
+    "cmv3m1y1b00dul506oykng0uf": "bright",
+    "csh-1791759284606-948054": "bright",
+    "csh-1791759313480-866327": "bright",
+    "cmv72cos6007al506ibdb3i31": "cocoloco1987",
+    "csh-1792475406492-114": "cocoloco1987",
+    "csh-1792781826210-582": "cocoloco1987",
+    "cmv59j7cl000nnv05922oi3dp": "elies909",
+    "csh-1792492447863-433": "elies909",
+    "csh-1792492508345-119": "elies909",
+    "csh-1793187544780-4103a3f9": "elies909",
+    "csh-1793187544792-a3be1ec9": "elies909",
+    "csh-1793187544815-a1d0222c": "elies909",
+    "csh-1793187544827-e1621cdf": "elies909",
+    "cmv5r4y5100dulh067b6ysa02": "faith",
+    "csh-1792184718151-851": "faith",
+    "csh-f-1791849930591-5f6f8d35": "faith",
+    "csh-f-1791988369922-6e686a53": "faith",
+    "cmv93arq50000o402beckdjc8": "geeta",
+    "csh-1792196528599-933": "geeta",
+    "csh-1792505107903-789": "geeta",
+    "csh-f-1792126845527-74c24485": "geeta",
+    "csh-f-1792257297562-0a3e4242": "geeta",
+    "cmv84et1r0014pk021pz4mq3b": "glitchin0",
+    "csh-1792458619158-698": "glitchin0",
+    "csh-1792461684573-472": "glitchin0",
+    "csh-f-1792163184219-4888af2c": "glitchin0",
+    "csh-f-1792418794699-12bc26e6": "glitchin0",
+    "cmv7ijxqk0082od023mgbf48z": "goku364747",
+    "csh-1792589107258-194": "goku364747",
+    "csh-1792589347053-392": "goku364747",
+    "csh-f-1792287801113-2683d390": "goku364747",
+    "csh-f-1792505273603-91d25d95": "goku364747",
+    "csh-f-1792505403895-dac4c495": "goku364747",
+    "cmvbv6o01000ipd028ibyfqad": "goru",
+    "csh-1792592286817-598": "goru",
+    "csh-1793114078058-7cee7bf4": "goru",
+    "cmvb5elie0000nz02sla2pwlk": "king_tonka1",
+    "csh-1792170610658-261": "king_tonka1",
+    "csh-1792180436888-728": "king_tonka1",
+    "csh-f-1792186468895-cfa48420": "king_tonka1",
+    "cmuvaqbfe0003nw0564aljbec": "maomaoyu",
+    "csh-1791932821232-881": "maomaoyu",
+    "csh-f-1792352742162-ffdc1984": "maomaoyu",
+    "cmuzp0arl0000ot06t8cbcyok": "napol",
+    "csh-1792025292396-573": "napol",
+    "csh-1792096388345-372": "napol",
+    "cmv635q1m032xjs06mvptcder": "nex",
+    "csh-1792254961377-265": "nex",
+    "csh-f-1792043546696-e98132e6": "nex",
+    "csh-f-1792260755646-78452835": "nex",
+    "cmuvh4b6j0004ow06ccp8zdkr": "omega",
+    "csh-1791879847625-771": "omega",
+    "csh-1791916081200-499": "omega",
+    "cmuwmis2k0007jv045lym10ex": "paimon26",
+    "csh-1791288846411-691": "paimon26",
+    "csh-1791303940363-432": "paimon26",
+    "cmv5trxrd00e5ny06rmvevv04": "posiii",
+    "csh-1792093996584-263": "posiii",
+    "csh-1792094071412-238": "posiii",
+    "csh-1792168623898-853": "posiii",
+    "csh-1792231600637-141": "posiii",
+    "cmv4w94rv0000ml06olj4oiah": "r4vsilvz",
+    "csh-1791790696698-518": "r4vsilvz",
+    "cmvaykepq000cjq06hivr2fka": "reivouz",
+    "csh-1792155127138-268": "reivouz",
+    "csh-1792165849718-804": "reivouz",
+    "cmv3tugco0000p6066kgsnziy": "rempo",
+    "csh-1792873164511-884": "rempo",
+    "cmv43rc800006jp06k7jt4l11": "rks",
+    "csh-1792434787108-147": "rks",
+    "csh-1792435148453-748": "rks",
+    "cmv5btigh0018nu053gaocwi9": "sadu23ni",
+    "csh-1791815210864-333": "sadu23ni",
+    "cmv5352880009jp06hnffcodf": "shahzib",
+    "csh-1792077189665-712": "shahzib",
+    "csh-1792221847251-775": "shahzib",
+    "cmuyi8hvx00cdl70458dix7kg": "shehzadalam0333",
+    "csh-1792252331684-550": "shehzadalam0333",
+    "csh-1792808886231-829": "shehzadalam0333",
+    "cmuvog96k0001jl04t9d9amyr": "sidneycrosby",
+    "csh-1791383912278-877": "sidneycrosby",
+    "csh-1791853994203-711": "sidneycrosby",
+    "csh-f-1792434184628-92079cae": "sidneycrosby",
+    "csh-f-1792456629908-ec70eaa8": "sidneycrosby",
+    "csh-f-1792469846891-c477dcc5": "sidneycrosby",
+    "cmvmujxqd0000jy08macrrcsc": "yungthug",
+    "csh-1792873926256-264": "yungthug",
+    "cmv7yi1lc0006mf024j029200": "zymoney",
+    "csh-f-1792025490308-4b8f0eb9": "zymoney",
+    "csh-f-1792075751520-187e2b37": "zymoney",
+    "csh-f-1792163490740-b2b29ac3": "zymoney",
+}
 
-def load_hedge_watchlist() -> dict:
+
+def load_hedge_watchlist() -> tuple[dict, dict]:
+    """(names: username -> why, keys: email / account ID / Cashed user ID -> username)"""
     try:
         with open(HEDGE_WATCH_FILE, encoding="utf-8") as f:
-            return {k.lower(): v for k, v in json.load(f).items()}
+            d = json.load(f)
+        if "names" not in d:  # older file: just names
+            d = {"names": d, "keys": {}}
+        keys = dict(HEDGE_KEYS_DEFAULT)
+        keys.update({k.lower(): v for k, v in d.get("keys", {}).items()})
+        return {k.lower(): v for k, v in d["names"].items()}, keys
     except Exception:
-        return dict(HEDGE_WATCHLIST_DEFAULT)
+        return dict(HEDGE_WATCHLIST_DEFAULT), dict(HEDGE_KEYS_DEFAULT)
 
 
-def save_hedge_watchlist(d: dict):
+def save_hedge_watchlist(names: dict, keys: dict):
     os.makedirs(DATA_DIR, exist_ok=True)
+    extra = {k: v for k, v in keys.items() if HEDGE_KEYS_DEFAULT.get(k) != v}
     with open(HEDGE_WATCH_FILE, "w", encoding="utf-8") as f:
-        json.dump(d, f)
+        json.dump({"names": names, "keys": extra}, f)
+
+
+EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+ACCOUNT_ID_RE = re.compile(r"\b(CS[HF]?-(?:F-)?[A-Z0-9]+(?:-[A-Z0-9]+)*)\b", re.I)
+USER_ID_RE = re.compile(r"\b(cm[a-z0-9]{20,30})\b")
 
 
 def _name_tokens(text: str) -> set[str]:
@@ -2791,7 +2911,7 @@ def _name_tokens(text: str) -> set[str]:
     return toks
 
 
-async def hedge_matches(guild: discord.Guild, watch: dict) -> list[dict]:
+async def hedge_matches(guild: discord.Guild, watch: dict, keys: dict) -> list[dict]:
     names = set(watch)
     found = []
     sem = asyncio.Semaphore(5)
@@ -2813,6 +2933,15 @@ async def hedge_matches(guild: discord.Guild, watch: dict) -> list[dict]:
                     for line in re.findall(r"(?i)\b(?:user(?:name)?|account)\b[\s*:_\-]{1,8}@?([A-Za-z0-9_.]{2,40})", text):
                         if line.lower() in names:
                             why.append(("payout form", [line.lower()]))
+                    for found_key, label in ((x.lower(), "email") for x in EMAIL_RE.findall(text)):
+                        if found_key in keys:
+                            why.append((label, [keys[found_key]]))
+                    for found_key in (x.lower() for x in ACCOUNT_ID_RE.findall(text)):
+                        if found_key in keys:
+                            why.append(("account ID", [keys[found_key]]))
+                    for found_key in USER_ID_RE.findall(text):
+                        if found_key in keys:
+                            why.append(("Cashed user ID", [keys[found_key]]))
             except (discord.Forbidden, discord.HTTPException):
                 pass
             member = None
@@ -2823,6 +2952,14 @@ async def hedge_matches(guild: discord.Guild, watch: dict) -> list[dict]:
                     member = None
             member = member or opener
             if member is not None:
+                info = await cashed_lookup(member.id)  # their linked Cashed account (Discord link on cashed.fun)
+                if info and info.get("linked"):
+                    lu = (info.get("username") or "").lower()
+                    le = (info.get("email") or "").lower()
+                    if lu in names:
+                        why.append(("linked Cashed account", [lu]))
+                    if le and le in keys:
+                        why.append(("linked email", [keys[le]]))
                 disc = {(getattr(member, a, None) or "").lower() for a in ("name", "global_name", "display_name", "nick")}
                 hit = sorted(n for n in names if n in disc)
                 if hit:
@@ -2873,26 +3010,37 @@ class HedgeScanView(discord.ui.View):
 
 
 @bot.tree.command(name="hedgescan", description="Find open tickets from traders on the hedging watchlist and flag them")
-@app_commands.describe(add="Usernames to add to the watchlist (space separated)",
-                       remove="Usernames to remove from the watchlist (space separated)")
+@app_commands.describe(add="Usernames, emails or account IDs to add (space separated; email=username to say whose)",
+                       remove="Usernames, emails or account IDs to remove (space separated)")
 async def hedgescan(interaction: discord.Interaction, add: str = "", remove: str = ""):
     if STAFF_ROLE_IDS and not is_staff(interaction.user):
         await interaction.response.send_message("This command is for staff only.", ephemeral=True)
         return
     await interaction.response.defer(ephemeral=True, thinking=True)
-    watch = load_hedge_watchlist()
+    watch, keys = load_hedge_watchlist()
     changed = False
     for u in re.split(r"[\s,]+", add.strip()):
-        if u:
-            watch[u.lstrip("@").lower()] = watch.get(u.lstrip("@").lower()) or f"added by {interaction.user}"
-            changed = True
+        if not u:
+            continue
+        # name, or email / account ID / Cashed user ID (optionally "key=username" to say whose it is)
+        key, _, owner = u.partition("=")
+        key = key.lstrip("@").lower() if "@" not in key[1:] else key.lower()
+        if EMAIL_RE.fullmatch(key) or ACCOUNT_ID_RE.fullmatch(key) or USER_ID_RE.fullmatch(key):
+            keys[key] = (owner or key).lstrip("@").lower()
+            if owner and owner.lstrip("@").lower() not in watch:
+                watch[owner.lstrip("@").lower()] = f"added by {interaction.user}"
+        else:
+            watch[key] = watch.get(key) or f"added by {interaction.user}"
+        changed = True
     for u in re.split(r"[\s,]+", remove.strip()):
-        if u and watch.pop(u.lstrip("@").lower(), None) is not None:
+        u = u.lstrip("@").lower() if u and "@" not in u[1:] else (u or "").lower()
+        if u and (watch.pop(u, None) is not None or keys.pop(u, None) is not None):
             changed = True
     if changed:
-        save_hedge_watchlist(watch)
-    matches = await hedge_matches(interaction.guild, watch)
-    head = f"**Hedging watchlist:** {len(watch)} usernames" + (" (updated)" if changed else "")
+        save_hedge_watchlist(watch, keys)
+    matches = await hedge_matches(interaction.guild, watch, keys)
+    head = (f"**Hedging watchlist:** {len(watch)} usernames · {len(keys)} emails/account IDs"
+            + (" (updated)" if changed else ""))
     if not matches:
         await interaction.followup.send(head + "\nNo open tickets match anyone on the list.", ephemeral=True)
         return
@@ -2900,8 +3048,9 @@ async def hedgescan(interaction: discord.Interaction, add: str = "", remove: str
              for m in matches]
     embeds = _chunks(f"{len(matches)} open ticket(s) match the hedging watchlist", lines, 0xDC2626)
     embeds[-1].set_footer(text="Check the matches, then press Hedge all to move them to the risk category quietly.")
-    await interaction.followup.send(head + "\nMatched on Cashed username (ticket name or payout form) or the opener's "
-                                    "Discord name. A Discord-name-only match can be a different person, so check those.",
+    await interaction.followup.send(head + "\nMatches on Cashed username (ticket name, payout form or linked account), "
+                                    "email, account ID, Cashed user ID or the opener's Discord name. A Discord-name-only "
+                                    "match can be a different person, so check those.",
                                     embeds=embeds[:10], view=HedgeScanView(interaction.user.id, matches, watch),
                                     ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
 
