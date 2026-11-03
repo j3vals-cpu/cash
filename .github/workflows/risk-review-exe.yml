@@ -3,7 +3,7 @@ name: Build Cashed Risk Review (Windows)
 on:
   push:
     branches: [main]
-    paths: ["risk_app.py", "risk_review.py", "risk_report.py", "risk_selftest.py", ".github/workflows/risk-review-exe.yml"]
+    paths: ["risk_app.py", "risk_review.py", "risk_report.py", "risk_selftest.py", "risk_scan.py", ".github/workflows/risk-review-exe.yml"]
   workflow_dispatch:
 
 permissions:
