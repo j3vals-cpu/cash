@@ -3,7 +3,7 @@ name: Build Cashed Risk Review (Windows)
 on:
   push:
     branches: [main]
-    paths: ["risk_app.py", "risk_review.py", "risk_report.py", ".github/workflows/risk-review-exe.yml"]
+    paths: ["risk_app.py", "risk_review.py", "risk_report.py", "risk_selftest.py", ".github/workflows/risk-review-exe.yml"]
   workflow_dispatch:
 
 permissions:
@@ -21,17 +21,14 @@ jobs:
         run: python -m pip install --upgrade pip pyinstaller tzdata
       - name: Build the .exe
         run: pyinstaller --onefile --windowed --name CashedRiskReview --collect-data tzdata --hidden-import tzdata risk_app.py
-      - name: Smoke test (parse + report)
-        shell: python
-        run: |
-          import risk_review, risk_report
-          t = risk_review.parse_export("KORU-USD Perpetual\nabc\nSHORT\tSETTLED\t$15,726\t5×\t11.843\t11.834\t— / —\t$6.29\t$5.66\t02/11/2026, 14:08:43\t02/11/2026, 14:09:16")
-          assert len(t) == 1, t
-          assert "trade overview" in risk_report.build_html(t)
-          print("ok")
+      - name: Self-test (parse + report)
+        run: python risk_selftest.py
+        env:
+          PYTHONUTF8: "1"
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: risk-review-${{ github.run_number }}
           name: Cashed Risk Review ${{ github.run_number }}
           files: dist/CashedRiskReview.exe
+          body_path: selftest.txt
