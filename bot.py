@@ -2378,6 +2378,10 @@ def not_verified_msg() -> str:
             f"<{CASHED_LINK_URL}>\nOnce it's linked, press **Verify** and you'll be able to open a payout ticket.")
 
 
+PAYOUT_TICKET_CATEGORY_ID = int(os.getenv("PAYOUT_TICKET_CATEGORY_ID", "1567163581710209104") or 0)  # verified payouts
+PAYOUT_BUG_CATEGORY_ID = int(os.getenv("PAYOUT_BUG_CATEGORY_ID", "1567163792759201873") or 0)        # payout bugs
+
+
 def open_ticket_of(guild, user_id, kind: str = "Payout ticket"):
     return next((c for c in guild.text_channels if our_ticket(c) and f"uid:{user_id}" in (c.topic or "")
                  and (f"· {kind} ·" in (c.topic or "") or (kind == "Payout ticket" and "· Payout bug ·" not in (c.topic or "")))),
@@ -2590,7 +2594,8 @@ class PayoutBugButton(discord.ui.DynamicItem[discord.ui.Button], template=r"cash
                                                     ephemeral=True)
             return
         info = await cashed_lookup(interaction.user.id)
-        await interaction.response.send_modal(PayoutBugForm(self.category_id, info if info and info.get("linked") else None))
+        await interaction.response.send_modal(PayoutBugForm(PAYOUT_BUG_CATEGORY_ID or self.category_id,
+                                                            info if info and info.get("linked") else None))
 
 
 class OpenTicketButton(discord.ui.DynamicItem[discord.ui.Button], template=r"cashed:open:(?P<cat>\d+)"):
@@ -2621,7 +2626,8 @@ class OpenTicketButton(discord.ui.DynamicItem[discord.ui.Button], template=r"cas
         if not verified:
             await interaction.response.send_message(not_verified_msg(), ephemeral=True)
             return
-        await interaction.response.send_modal(PayoutForm(self.category_id, info if info and info.get("linked") else None))
+        await interaction.response.send_modal(PayoutForm(PAYOUT_TICKET_CATEGORY_ID or self.category_id,
+                                                         info if info and info.get("linked") else None))
 
 
 # ---- closing our own tickets (staff only): transcript -> log channel, then delete the channel
@@ -2717,8 +2723,8 @@ async def close_cmd(interaction: discord.Interaction):
 
 
 @bot.tree.command(name="panel", description="Post the 'Open payout ticket' panel in this channel")
-@app_commands.describe(category="Category the payout tickets are created in")
-async def panel(interaction: discord.Interaction, category: discord.CategoryChannel):
+@app_commands.describe(category="Optional: only needed if the payout ticket category isn't set")
+async def panel(interaction: discord.Interaction, category: discord.CategoryChannel = None):
     if not (interaction.user.guild_permissions.administrator or is_staff(interaction.user)):
         await interaction.response.send_message("Staff only.", ephemeral=True)
         return
@@ -2733,12 +2739,18 @@ async def panel(interaction: discord.Interaction, category: discord.CategoryChan
             "Only verified accounts can open payout tickets. Make sure your wallet address and network are correct."),
         colour=0x16A34A)
     v = discord.ui.View(timeout=None)
-    v.add_item(OpenTicketButton(category.id))
-    v.add_item(PayoutBugButton(category.id))
+    cat_id = category.id if category else PAYOUT_TICKET_CATEGORY_ID
+    if not cat_id:
+        await interaction.response.send_message("Pick the category tickets should open in.", ephemeral=True)
+        return
+    v.add_item(OpenTicketButton(cat_id))
+    v.add_item(PayoutBugButton(PAYOUT_BUG_CATEGORY_ID or cat_id))
     v.add_item(VerifyButton())
     v.add_item(discord.ui.Button(label="Link account", style=discord.ButtonStyle.link, url=CASHED_LINK_URL))
     await interaction.channel.send(embed=e, view=v)
-    await interaction.response.send_message(f"Panel posted. Tickets will open in **{category.name}**.", ephemeral=True)
+    await interaction.response.send_message(
+        f"Panel posted. Payout tickets open in <#{cat_id}>, payout bugs in <#{PAYOUT_BUG_CATEGORY_ID or cat_id}>.",
+        ephemeral=True)
 
 
 # --------------------------------------------------------------------------- #
