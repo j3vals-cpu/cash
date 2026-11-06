@@ -32,7 +32,7 @@ PATTERNS = [
     # "payout ... not paid / not received / never came"
     r"(?i)\b" + _W + r"\b[ -~]{0,40}\b(?:not (?:been )?(?:paid|received|sent|processed|approved|arrived)|never (?:came|arrived|received|paid))\b",
     # "when will my payout come", "where is my money"
-    r"(?i)\b(?:when|where)(?:'s|s| is| will| does| tf is)? +(?:my|the|our|is my) +(?:[a-z0-9]+ +)?" + _W + r"\b",
+    r"(?i)\b(?:when|where)(?:'s|s| is| are| r| will| tf is)? +(?:(?:my|the|our|is my|are my) +(?:[a-z0-9]+ +)?)?" + _W + r"\b",
     # "no response on my payout ticket"
     # ... and "payout where", "payout when??"
     r"(?i)\bno (?:reply|response|answer|update|one)\b[ -~]{0,30}\b(?:" + _PAY + r"|ticket)\b|\bp[a@4]y[ ._-]?[o0][uv][tr]s? +(?:where|wen|when)\b",
