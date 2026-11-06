@@ -78,26 +78,8 @@ class FilterStore:
 def notice_text(bot: discord.Client, cfg: dict) -> str:
     ch = bot.get_channel(int(cfg.get("ticket_channel") or 0))
     where = f"#{ch.name}" if ch else "the payout ticket channel"
-    msg = f"\u26a0\ufe0f We understand your issue, but general isn't the place for it. Open a payout ticket in {where} \U0001f449 link in your DMs."
+    msg = f"We understand your issue, however general is not the place for it. Please open a payout ticket in {where}."
     return msg[:150]
-
-
-def notice_embed(bot: discord.Client, cfg: dict, guild: discord.Guild) -> tuple[discord.Embed, discord.ui.View]:
-    """The tidy version sent to the member: an embed plus a button that jumps straight to the ticket channel."""
-    cid = int(cfg.get("ticket_channel") or DEFAULT_TICKET_CHANNEL)
-    ch = bot.get_channel(cid)
-    gid = ch.guild.id if ch else guild.id
-    url = f"https://discord.com/channels/{gid}/{cid}"
-    e = discord.Embed(
-        title="\U0001f4ac Payout questions go in a ticket",
-        description=("We understand your issue, but general isn't the place for it.\n\n"
-                     f"Open a payout ticket in {ch.mention if ch else 'the payout ticket channel'} and the team "
-                     "will pick it up there."),
-        colour=0x16A34A)
-    e.set_footer(text=f"{guild.name} \u00b7 your message in general wasn't posted")
-    v = discord.ui.View(timeout=None)
-    v.add_item(discord.ui.Button(style=discord.ButtonStyle.link, label="Open a payout ticket", emoji="\U0001f39f\ufe0f", url=url))
-    return e, v
 
 
 def _exempt_channels(guild: discord.Guild, watched: set[int], use_categories: bool) -> list:
