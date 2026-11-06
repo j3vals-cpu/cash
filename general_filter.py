@@ -34,7 +34,8 @@ PATTERNS = [
     # "when will my payout come", "where is my money"
     r"(?i)\b(?:when|where)(?:'s|s| is| will| does| tf is)? +(?:my|the|our|is my) +(?:[a-z0-9]+ +)?" + _W + r"\b",
     # "no response on my payout ticket"
-    r"(?i)\bno (?:reply|response|answer|update|one)\b[ -~]{0,30}\b(?:" + _PAY + r"|ticket)\b",
+    # ... and "payout where", "payout when??"
+    r"(?i)\bno (?:reply|response|answer|update|one)\b[ -~]{0,30}\b(?:" + _PAY + r"|ticket)\b|\bp[a@4]y[ ._-]?[o0][uv][tr]s? +(?:where|wen|when)\b",
     # "waiting ... for my payout", "pending payout"
     r"(?i)\b(?:" + _WAIT + r"|" + _PEND + r")\b[ -~]{0,40}\b" + _W + r"\b",
     # "haven't received my payout", "still not paid"
