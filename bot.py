@@ -3767,7 +3767,7 @@ async def on_automod_action(execution: discord.AutoModAction):
         _fud_rule_names[execution.rule_id] = name
     if name == general_filter.RULE_NAME:
         reason, colour = "Blocked: payout complaint in general", 0xDC2626
-    elif name == general_filter.TAG_RULE:
+    elif name == general_filter.TAG_RULE or execution.rule_trigger_type == discord.AutoModRuleTriggerType.mention_spam:
         reason, colour = "Blocked: more than one tag", 0xF59E0B
     else:
         return

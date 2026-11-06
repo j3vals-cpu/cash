@@ -111,8 +111,8 @@ TAG_RULE = "Cashed Bot: one tag per message"
 TAG_NOTICE = "You can only tag one person per message."
 
 
-async def _upsert(guild, rules, name, trigger, message, roles, watched) -> str | None:
-    rule = next((r for r in rules if r.name == name), None)
+async def _upsert(guild, rules, name, trigger, message, roles, watched, rule=None) -> str | None:
+    rule = rule or next((r for r in rules if r.name == name), None)
     actions = [discord.AutoModRuleAction(custom_message=message[:150])]
     last = None
     for use_cats in (True, False):  # categories first; fall back to listing channels one by one
@@ -161,24 +161,21 @@ async def apply_rule(bot: discord.Client, guild: discord.Guild, cfg: dict, staff
             for r in rules:
                 if r.name == RULE_NAME:
                     await r.delete(reason="Payout complaint filter switched off")
-        # One tag per message (/fud tags)
+        # One tag per message (/fud tags). Discord allows one mention-spam rule per server, so take over the
+        # existing one (e.g. its built-in "Block Mention Spam") instead of making a second.
+        mrule = next((r for r in rules if r.name == TAG_RULE), None) or next(
+            (r for r in rules if r.trigger.type == discord.AutoModRuleTriggerType.mention_spam), None)
         if tagged:
-            other = next((r for r in rules if r.trigger.type == discord.AutoModRuleTriggerType.mention_spam
-                          and r.name != TAG_RULE), None)
-            if other:
-                errs.append(f"One-tag limit not set: Discord allows one mention-spam rule and **{other.name}** "
-                            f"already exists. Delete it in Server Settings → AutoMod, then run `/fud status`.")
-            else:
-                e2 = await _upsert(guild, rules, TAG_RULE,
-                                   discord.AutoModTrigger(type=discord.AutoModRuleTriggerType.mention_spam,
-                                                          mention_limit=1),
-                                   TAG_NOTICE, roles, tagged)
-                if e2:
-                    errs.append(e2)
-        else:
-            for r in rules:
-                if r.name == TAG_RULE:
-                    await r.delete(reason="One-tag limit switched off")
+            e2 = await _upsert(guild, rules, TAG_RULE,
+                               discord.AutoModTrigger(type=discord.AutoModRuleTriggerType.mention_spam, mention_limit=1),
+                               TAG_NOTICE, roles, tagged, rule=mrule)
+            if e2:
+                errs.append(e2)
+        elif mrule is not None:
+            if mrule.name == TAG_RULE:
+                await mrule.delete(reason="One-tag limit switched off")
+            elif mrule.enabled and any(getattr(a, "custom_message", None) == TAG_NOTICE for a in mrule.actions):
+                await mrule.edit(enabled=False, reason="One-tag limit switched off")
         return "\n".join(errs) or None
     except discord.Forbidden:
         return "The bot needs the **Manage Server** permission (Server Settings → Roles → bot role)."
