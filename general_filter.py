@@ -77,7 +77,8 @@ class FilterStore:
 
 def notice_text(bot: discord.Client, cfg: dict) -> str:
     ch = bot.get_channel(int(cfg.get("ticket_channel") or 0))
-    where = f"#{ch.name}" if ch else "the payout ticket channel"
+    # <#id> shows as a clickable channel link where Discord renders it
+    where = f"<#{ch.id}>" if ch else "the payout ticket channel"
     msg = f"We understand your issue, however general is not the place for it. Please open a payout ticket in {where}."
     return msg[:150]
 
