@@ -3639,8 +3639,17 @@ async def on_guild_channel_update(before, after):
         bot.loop.create_task(_fud_refresh(after.guild))
 
 
+FUD_TEST_TICKET_CHANNEL = 1566604554890379395  # testing: point the notice at this channel in its own server
+
+
 async def fud_rule_on_start():
     await bot.wait_until_ready()
+    test = bot.get_channel(FUD_TEST_TICKET_CHANNEL)
+    if test is not None:
+        cfg = fud_store.get(test.guild.id)
+        if cfg.get("ticket_channel") != test.id:
+            cfg["ticket_channel"] = test.id
+            fud_store.save()
     for gid, cfg in list(fud_store.guilds.items()):
         g = bot.get_guild(int(gid))
         if g and cfg.get("channels"):
