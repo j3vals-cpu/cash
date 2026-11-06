@@ -2436,6 +2436,27 @@ class VerifyButton(discord.ui.DynamicItem[discord.ui.Button], template=r"cashed:
         await interaction.followup.send(not_verified_msg(), ephemeral=True)
 
 
+_overflow_lock = asyncio.Lock()
+
+
+async def ticket_category(guild: discord.Guild, base: discord.CategoryChannel) -> discord.CategoryChannel:
+    """Discord caps a category at 50 channels. When the main one is full, use (or create) an overflow category
+    right below it: '<name> 2', '<name> 3', ... with the same permissions."""
+    if len(base.channels) < 50:
+        return base
+    async with _overflow_lock:
+        n = 2
+        while True:
+            name = f"{base.name} {n}"
+            cat = discord.utils.get(guild.categories, name=name)
+            if cat is None:
+                return await guild.create_category(name, overwrites=base.overwrites, position=base.position + n - 1,
+                                                   reason="Ticket category full: overflow")
+            if len(cat.channels) < 50:
+                return cat
+            n += 1
+
+
 class PayoutForm(discord.ui.Modal, title="Payout request"):
     def __init__(self, category_id: int, info: dict | None):
         super().__init__(timeout=900)
@@ -2463,6 +2484,10 @@ class PayoutForm(discord.ui.Modal, title="Payout request"):
             await interaction.followup.send("Payout tickets aren't set up properly. Please contact support.",
                                             ephemeral=True)
             return
+        try:
+            cat = await ticket_category(guild, cat)
+        except discord.HTTPException:
+            log.exception("Couldn't make an overflow payout category")
         overwrites = dict(cat.overwrites)
         overwrites[guild.default_role] = discord.PermissionOverwrite(view_channel=False)
         overwrites[user] = discord.PermissionOverwrite(view_channel=True, send_messages=True,
@@ -2545,6 +2570,10 @@ class PayoutBugForm(discord.ui.Modal, title="Report a payout bug"):
         if not isinstance(cat, discord.CategoryChannel):
             await interaction.followup.send("Tickets aren't set up properly. Please contact support.", ephemeral=True)
             return
+        try:
+            cat = await ticket_category(guild, cat)
+        except discord.HTTPException:
+            log.exception("Couldn't make an overflow payout bug category")
         overwrites = dict(cat.overwrites)
         overwrites[guild.default_role] = discord.PermissionOverwrite(view_channel=False)
         overwrites[user] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True,
