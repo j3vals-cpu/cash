@@ -106,43 +106,68 @@ def _exempt_channels(guild: discord.Guild, watched: set[int], use_categories: bo
     return out
 
 
+TAG_RULE = "Cashed Bot: one tag per message"
+TAG_NOTICE = "You can only tag one person per message."
+
+
+async def _upsert(guild, rules, name, trigger, message, roles, watched) -> str | None:
+    rule = next((r for r in rules if r.name == name), None)
+    actions = [discord.AutoModRuleAction(custom_message=message[:150])]
+    last = None
+    for use_cats in (True, False):  # categories first; fall back to listing channels one by one
+        exempt = _exempt_channels(guild, watched, use_cats)
+        if len(exempt) > 50:
+            last = (f"This server has {len(exempt)} channels/categories outside the filtered ones, and Discord "
+                    f"only allows 50 exemptions. Move loose channels into categories, then try again.")
+            continue
+        try:
+            kw = dict(trigger=trigger, actions=actions, exempt_roles=roles, exempt_channels=exempt, enabled=True)
+            if rule:
+                await rule.edit(reason="General filter updated", **kw)
+            else:
+                await guild.create_automod_rule(name=name, event_type=discord.AutoModRuleEventType.message_send,
+                                                reason="General filter set up", **kw)
+            return None
+        except discord.HTTPException as e:
+            if isinstance(e, discord.Forbidden):
+                raise
+            last = f"Discord refused the {name!r} rule: {e.text or e}"
+            log.warning("%s (categories=%s) refused: %s", name, use_cats, e)
+    return last
+
+
 async def apply_rule(bot: discord.Client, guild: discord.Guild, cfg: dict, staff_role_ids) -> str | None:
-    """Create, update or remove the AutoMod rule for this server. Returns an error message, or None."""
+    """Create, update or remove the AutoMod rules for this server: payout complaints, and one tag per message.
+    Returns an error message, or None."""
     try:
         rules = await guild.fetch_automod_rules()
     except discord.Forbidden:
         return "The bot needs the **Manage Server** permission (Server Settings → Roles → bot role)."
-    rule = next((r for r in rules if r.name == RULE_NAME), None)
     watched = {int(c) for c in cfg.get("channels", []) if guild.get_channel(int(c))}
     try:
         if not watched:
-            if rule:
-                await rule.delete(reason="Payout complaint filter switched off")
+            for r in rules:
+                if r.name in (RULE_NAME, TAG_RULE):
+                    await r.delete(reason="General filter switched off")
             return None
-        trigger = discord.AutoModTrigger(type=discord.AutoModRuleTriggerType.keyword, regex_patterns=PATTERNS)
-        actions = [discord.AutoModRuleAction(custom_message=notice_text(bot, cfg))]
         roles = [r for r in (guild.get_role(i) for i in staff_role_ids) if r][:20]
-        last = None
-        for use_cats in (True, False):  # categories first; fall back to listing channels one by one
-            exempt = _exempt_channels(guild, watched, use_cats)
-            if len(exempt) > 50:
-                last = (f"This server has {len(exempt)} channels/categories outside the filtered ones, and Discord "
-                        f"only allows 50 exemptions. Move loose channels into categories, then try again.")
-                continue
-            try:
-                kw = dict(trigger=trigger, actions=actions, exempt_roles=roles, exempt_channels=exempt, enabled=True)
-                if rule:
-                    await rule.edit(reason="Payout complaint filter updated", **kw)
-                else:
-                    rule = await guild.create_automod_rule(name=RULE_NAME,
-                                                           event_type=discord.AutoModRuleEventType.message_send,
-                                                           reason="Payout complaint filter set up", **kw)
-                return None
-            except discord.HTTPException as e:
-                if isinstance(e, discord.Forbidden):
-                    raise
-                last = f"Discord refused the rule: {e.text or e}"
-                log.warning("General filter rule (categories=%s) refused: %s", use_cats, e)
-        return last
+        errs = []
+        e1 = await _upsert(guild, rules, RULE_NAME,
+                           discord.AutoModTrigger(type=discord.AutoModRuleTriggerType.keyword, regex_patterns=PATTERNS),
+                           notice_text(bot, cfg), roles, watched)
+        if e1:
+            errs.append(e1)
+        other = next((r for r in rules if r.trigger.type == discord.AutoModRuleTriggerType.mention_spam
+                      and r.name != TAG_RULE), None)
+        if other:
+            errs.append(f"One-tag limit not set: Discord allows one mention-spam rule and **{other.name}** already "
+                        f"exists. Delete it in Server Settings → AutoMod, then run `/fud status`.")
+        else:
+            e2 = await _upsert(guild, rules, TAG_RULE,
+                               discord.AutoModTrigger(type=discord.AutoModRuleTriggerType.mention_spam, mention_limit=1),
+                               TAG_NOTICE, roles, watched)
+            if e2:
+                errs.append(e2)
+        return "\n".join(errs) or None
     except discord.Forbidden:
         return "The bot needs the **Manage Server** permission (Server Settings → Roles → bot role)."

@@ -3294,6 +3294,7 @@ async def on_message(message: discord.Message):
         return
     if is_mod(message.author):
         mod_stats.add(message.author, message.channel, message.created_at.timestamp())
+    await tag_bypass_check(message)
 
 
 MOD_PERIODS = [
@@ -3551,7 +3552,9 @@ async def fud_on(interaction: discord.Interaction, channel: discord.TextChannel 
     err = await _fud_apply(interaction.guild)
     await interaction.followup.send(
         err or f"Filter is on in {channel.mention}. Payout complaints get blocked and the sender privately sees:\n"
-               f"*{general_filter.notice_text(bot, cfg)}*\n\nAdmins and staff are never blocked, so test it "
+               f"*{general_filter.notice_text(bot, cfg)}*\n\nMessages tagging more than one person are blocked too, "
+               f"and tagging one person after another to get round it gets a warning, then a 6 hour timeout.\n\n"
+               f"Admins and staff are never blocked, so test it "
                f"with a normal member account. Use `/fud test` to check a message.", ephemeral=True)
 
 
@@ -3639,7 +3642,55 @@ async def on_guild_channel_update(before, after):
         bot.loop.create_task(_fud_refresh(after.guild))
 
 
-FUD_TEST_TICKET_CHANNEL = 1566604554890379395  # testing: point the notice at this channel in its own server
+TAG_BYPASS_WINDOW = 120         # tagging a different person within 2 minutes counts as getting round the limit
+TAG_STRIKE_RESET = 24 * 3600    # strikes are forgotten after a day
+TAG_TIMEOUT = timedelta(hours=6)
+_tag_last: dict[int, tuple[str, float]] = {}      # user -> (who they last tagged, when)
+_tag_strikes: dict[int, tuple[int, float]] = {}   # user -> (strikes, when the last one was)
+
+
+async def tag_bypass_check(message: discord.Message):
+    """One tag per message is enforced by AutoMod. This catches people tagging one person, then another straight
+    after: first time a warning, second time a 6 hour timeout."""
+    if message.guild is None or message.author.bot or is_staff(message.author):
+        return
+    if message.channel.id not in fud_store.get(message.guild.id)["channels"]:
+        return
+    tags = {t for t in re.findall(r"<@[!&]?(\d+)>", message.content) if t != str(message.author.id)}
+    if len(tags) != 1:
+        return
+    tag, now = tags.pop(), time.time()
+    prev = _tag_last.get(message.author.id)
+    _tag_last[message.author.id] = (tag, now)
+    if not prev or prev[0] == tag or now - prev[1] > TAG_BYPASS_WINDOW:
+        return
+    strikes, when = _tag_strikes.get(message.author.id, (0, 0))
+    if now - when > TAG_STRIKE_RESET:
+        strikes = 0
+    strikes += 1
+    _tag_strikes[message.author.id] = (strikes, now)
+    try:
+        await message.delete()
+    except discord.HTTPException:
+        pass
+    if strikes == 1:
+        text = (f"{message.author.mention} you can only tag one person. Splitting tags across messages to get round "
+                f"it isn't allowed. Do it again and you'll get a **6 hour timeout**.")
+    else:
+        try:
+            await message.author.timeout(TAG_TIMEOUT, reason="Kept getting round the one-tag limit")
+            text = f"{message.author.mention} has been timed out for 6 hours for getting round the one-tag limit."
+        except discord.HTTPException:
+            log.warning("Couldn't time out %s (bot needs Moderate Members, above their role)", message.author)
+            text = (f"{message.author.mention} you can only tag one person. This is your final warning: next time "
+                    f"it's a **6 hour timeout**.")
+    try:
+        await message.channel.send(text, delete_after=15, allowed_mentions=discord.AllowedMentions(users=True))
+    except discord.HTTPException:
+        pass
+
+
+FUD_TEST_TICKET_CHANNEL =1566604554890379395  # testing: point the notice at this channel in its own server
 
 
 async def fud_rule_on_start():
