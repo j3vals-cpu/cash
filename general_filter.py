@@ -69,6 +69,7 @@ class FilterStore:
     def get(self, guild_id: int) -> dict:
         g = self.guilds.setdefault(str(guild_id), {})
         g.setdefault("channels", [])
+        g.setdefault("tag_channels", list(g["channels"]))  # older setups had both on together
         g.setdefault("ticket_channel", DEFAULT_TICKET_CHANNEL)
         return g
 
@@ -144,30 +145,40 @@ async def apply_rule(bot: discord.Client, guild: discord.Guild, cfg: dict, staff
     except discord.Forbidden:
         return "The bot needs the **Manage Server** permission (Server Settings → Roles → bot role)."
     watched = {int(c) for c in cfg.get("channels", []) if guild.get_channel(int(c))}
+    tagged = {int(c) for c in cfg.get("tag_channels", []) if guild.get_channel(int(c))}
     try:
-        if not watched:
-            for r in rules:
-                if r.name in (RULE_NAME, TAG_RULE):
-                    await r.delete(reason="General filter switched off")
-            return None
         roles = [r for r in (guild.get_role(i) for i in staff_role_ids) if r][:20]
         errs = []
-        e1 = await _upsert(guild, rules, RULE_NAME,
-                           discord.AutoModTrigger(type=discord.AutoModRuleTriggerType.keyword, regex_patterns=PATTERNS),
-                           notice_text(bot, cfg), roles, watched)
-        if e1:
-            errs.append(e1)
-        other = next((r for r in rules if r.trigger.type == discord.AutoModRuleTriggerType.mention_spam
-                      and r.name != TAG_RULE), None)
-        if other:
-            errs.append(f"One-tag limit not set: Discord allows one mention-spam rule and **{other.name}** already "
-                        f"exists. Delete it in Server Settings → AutoMod, then run `/fud status`.")
+        # Payout complaint filter (/fud on|off)
+        if watched:
+            e1 = await _upsert(guild, rules, RULE_NAME,
+                               discord.AutoModTrigger(type=discord.AutoModRuleTriggerType.keyword,
+                                                      regex_patterns=PATTERNS),
+                               notice_text(bot, cfg), roles, watched)
+            if e1:
+                errs.append(e1)
         else:
-            e2 = await _upsert(guild, rules, TAG_RULE,
-                               discord.AutoModTrigger(type=discord.AutoModRuleTriggerType.mention_spam, mention_limit=1),
-                               TAG_NOTICE, roles, watched)
-            if e2:
-                errs.append(e2)
+            for r in rules:
+                if r.name == RULE_NAME:
+                    await r.delete(reason="Payout complaint filter switched off")
+        # One tag per message (/fud tags)
+        if tagged:
+            other = next((r for r in rules if r.trigger.type == discord.AutoModRuleTriggerType.mention_spam
+                          and r.name != TAG_RULE), None)
+            if other:
+                errs.append(f"One-tag limit not set: Discord allows one mention-spam rule and **{other.name}** "
+                            f"already exists. Delete it in Server Settings → AutoMod, then run `/fud status`.")
+            else:
+                e2 = await _upsert(guild, rules, TAG_RULE,
+                                   discord.AutoModTrigger(type=discord.AutoModRuleTriggerType.mention_spam,
+                                                          mention_limit=1),
+                                   TAG_NOTICE, roles, tagged)
+                if e2:
+                    errs.append(e2)
+        else:
+            for r in rules:
+                if r.name == TAG_RULE:
+                    await r.delete(reason="One-tag limit switched off")
         return "\n".join(errs) or None
     except discord.Forbidden:
         return "The bot needs the **Manage Server** permission (Server Settings → Roles → bot role)."
