@@ -288,6 +288,8 @@ class TicketBot(discord.Client):
                 c.default_permissions = None  # everyone in your private server can use them
                 self.tree.add_command(c, guild=og)
             self.tree.add_command(fud_group, guild=og, override=True)  # test the general filter in the office server
+            for c in (jail, unjail, jailchannel):
+                self.tree.add_command(c, guild=og, override=True)
         for cmd in self.tree.get_commands():
             cmd.default_permissions = discord.Permissions(administrator=True)
             cmd.guild_only = True
@@ -308,6 +310,7 @@ class TicketBot(discord.Client):
         self.loop.create_task(extras.timer_loop())
         self.loop.create_task(tag_rule_on_start())
         self.loop.create_task(fud_rule_on_start())
+        self.loop.create_task(jail_loop())
         self.loop.create_task(ultra_voice.ensure())  # download Ultra's voice in the background
         # Public API for the website's live payout feed (needs Railway public networking)
         import web_api
@@ -3810,6 +3813,137 @@ async def fud_rule_on_start():
             err = await _fud_apply(g)
             if err:
                 log.warning("General filter not active in %s: %s", g.name, err)
+
+
+# --------------------------------------------------------------------------- #
+# /jail: stop someone talking in general but leave tickets open to them (a Discord timeout blocks tickets too)
+# --------------------------------------------------------------------------- #
+
+JAIL_ROLE_NAME = "Jailed"
+JAIL_TIMES = [app_commands.Choice(name=n, value=v) for n, v in
+              [("1 hour", 3600), ("6 hours", 6 * 3600), ("24 hours", 86400), ("3 days", 3 * 86400),
+               ("7 days", 7 * 86400), ("Until unjailed", 0)]]
+
+
+def _jail_channels(guild: discord.Guild) -> list:
+    cfg = fud_store.get(guild.id)
+    ids = cfg.get("jail_channels") or list(dict.fromkeys(cfg["tag_channels"] + cfg["channels"]))
+    return [c for c in (guild.get_channel(int(i)) for i in ids) if c]
+
+
+async def _jail_role(guild: discord.Guild) -> discord.Role:
+    role = discord.utils.get(guild.roles, name=JAIL_ROLE_NAME)
+    if role is None:
+        role = await guild.create_role(name=JAIL_ROLE_NAME, reason="/jail set up")
+    deny = discord.PermissionOverwrite(send_messages=False, send_messages_in_threads=False,
+                                       create_public_threads=False, add_reactions=False)
+    for ch in _jail_channels(guild):
+        ow = ch.overwrites_for(role)
+        if ow.send_messages is not False:
+            await ch.set_permissions(role, overwrite=deny, reason="/jail: jailed members can't talk here")
+    return role
+
+
+@bot.tree.command(name="jail", description="Stop someone talking in general (they can still use tickets)")
+@app_commands.describe(member="Who to jail", length="How long", reason="Shown to them and in the log")
+@app_commands.choices(length=JAIL_TIMES)
+async def jail(interaction: discord.Interaction, member: discord.Member, length: app_commands.Choice[int],
+               reason: str = None):
+    if not await _tag_staff_ok(interaction):
+        return
+    if member.bot or is_staff(member):
+        await interaction.response.send_message("You can't jail staff or bots.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    guild = interaction.guild
+    if not _jail_channels(guild):
+        await interaction.followup.send("No general channel set yet. Run `/jailchannel` in general first.",
+                                        ephemeral=True)
+        return
+    try:
+        role = await _jail_role(guild)
+        await member.add_roles(role, reason=f"Jailed by {interaction.user}: {reason or 'no reason'}")
+    except discord.Forbidden:
+        await interaction.followup.send("The bot needs **Manage Roles** and **Manage Channels**, and its role must "
+                                        "be above the Jailed role.", ephemeral=True)
+        return
+    cfg = fud_store.get(guild.id)
+    until = time.time() + length.value if length.value else 0
+    cfg.setdefault("jailed", {})[str(member.id)] = until
+    fud_store.save()
+    where = " ".join(c.mention for c in _jail_channels(guild))
+    try:
+        await member.send(f"You've been muted in {where} on **{guild.name}** for {length.name.lower()}"
+                          + (f" ({reason})" if reason else "") + ". You can still open and use tickets.")
+    except discord.HTTPException:
+        pass
+    await fud_log(guild, member, interaction.channel, reason or "", f"Jailed for {length.name.lower()} by "
+                  f"{interaction.user}", 0x7C3AED)
+    await interaction.followup.send(f"{member.mention} is jailed for {length.name.lower()}. They can't talk in "
+                                    f"{where} but can still use tickets.", ephemeral=True)
+
+
+@bot.tree.command(name="unjail", description="Let someone talk in general again")
+async def unjail(interaction: discord.Interaction, member: discord.Member):
+    if not await _tag_staff_ok(interaction):
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    await _release(interaction.guild, member.id, f"Unjailed by {interaction.user}")
+    await interaction.followup.send(f"{member.mention} can talk in general again.", ephemeral=True)
+
+
+@bot.tree.command(name="jailchannel", description="Add or remove a channel jailed members can't talk in")
+@app_commands.choices(state=[app_commands.Choice(name="Add", value="add"), app_commands.Choice(name="Remove", value="remove")])
+async def jailchannel(interaction: discord.Interaction, state: app_commands.Choice[str], channel: discord.TextChannel = None):
+    if not await _tag_staff_ok(interaction):
+        return
+    channel = channel or interaction.channel
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    cfg = fud_store.get(interaction.guild_id)
+    chans = cfg.get("jail_channels") or [c.id for c in _jail_channels(interaction.guild)]
+    role = discord.utils.get(interaction.guild.roles, name=JAIL_ROLE_NAME)
+    if state.value == "add" and channel.id not in chans:
+        chans.append(channel.id)
+    elif state.value == "remove" and channel.id in chans:
+        chans.remove(channel.id)
+        if role:
+            await channel.set_permissions(role, overwrite=None, reason="/jailchannel remove")
+    cfg["jail_channels"] = chans
+    fud_store.save()
+    try:
+        await _jail_role(interaction.guild)
+    except discord.Forbidden:
+        await interaction.followup.send("The bot needs **Manage Roles** and **Manage Channels**.", ephemeral=True)
+        return
+    await interaction.followup.send("Jailed members can't talk in: " + (" ".join(f"<#{c}>" for c in chans) or "nowhere"),
+                                    ephemeral=True)
+
+
+async def _release(guild: discord.Guild, user_id: int, why: str):
+    cfg = fud_store.get(guild.id)
+    cfg.get("jailed", {}).pop(str(user_id), None)
+    fud_store.save()
+    role = discord.utils.get(guild.roles, name=JAIL_ROLE_NAME)
+    try:
+        member = guild.get_member(user_id) or await guild.fetch_member(user_id)
+        if role:
+            await member.remove_roles(role, reason=why)
+        await fud_log(guild, member, None, "", why, 0x16A34A)
+    except discord.HTTPException:
+        pass
+
+
+async def jail_loop():
+    """Let people out when their time is up."""
+    await bot.wait_until_ready()
+    while True:
+        now = time.time()
+        for gid, cfg in list(fud_store.guilds.items()):
+            g = bot.get_guild(int(gid))
+            for uid, until in list(cfg.get("jailed", {}).items()):
+                if g and until and until <= now:
+                    await _release(g, int(uid), "Jail time is up")
+        await asyncio.sleep(60)
 
 
 # --------------------------------------------------------------------------- #
