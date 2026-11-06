@@ -3639,6 +3639,46 @@ async def on_guild_channel_update(before, after):
         bot.loop.create_task(_fud_refresh(after.guild))
 
 
+_fud_rule_names: dict[int, str] = {}
+_fud_last_dm: dict[int, float] = {}
+
+
+@bot.event
+async def on_automod_action(execution: discord.AutoModAction):
+    """When the general filter blocks someone, DM them a tidy card with a button to the payout ticket channel."""
+    if execution.action.type != discord.AutoModRuleActionType.block_message:
+        return
+    guild = bot.get_guild(execution.guild_id)
+    if guild is None:
+        return
+    name = _fud_rule_names.get(execution.rule_id)
+    if name is None:
+        try:
+            name = (await guild.fetch_automod_rule(execution.rule_id)).name
+        except discord.HTTPException:
+            return
+        _fud_rule_names[execution.rule_id] = name
+    if name != general_filter.RULE_NAME:
+        return
+    now = time.time()
+    if now - _fud_last_dm.get(execution.user_id, 0) < 60:  # one card a minute, however many times they try
+        return
+    _fud_last_dm[execution.user_id] = now
+    embed, view = general_filter.notice_embed(bot, fud_store.get(guild.id), guild)
+    try:
+        user = execution.member or await bot.fetch_user(execution.user_id)
+        await user.send(embed=embed, view=view)
+    except discord.HTTPException:
+        # DMs closed: show it briefly in the channel instead, then delete it
+        ch = guild.get_channel(execution.channel_id) if execution.channel_id else None
+        if ch:
+            try:
+                await ch.send(content=f"<@{execution.user_id}>", embed=embed, view=view, delete_after=20,
+                              allowed_mentions=discord.AllowedMentions(users=True))
+            except discord.HTTPException:
+                pass
+
+
 async def fud_rule_on_start():
     await bot.wait_until_ready()
     for gid, cfg in list(fud_store.guilds.items()):
