@@ -288,7 +288,7 @@ class TicketBot(discord.Client):
                 c.default_permissions = None  # everyone in your private server can use them
                 self.tree.add_command(c, guild=og)
             self.tree.add_command(fud_group, guild=og, override=True)  # test the general filter in the office server
-            for c in (jail, unjail, jailchannel):
+            for c in (jail, unjail, jailchannel, mute_message_menu):
                 self.tree.add_command(c, guild=og, override=True)
         for cmd in self.tree.get_commands():
             cmd.default_permissions = discord.Permissions(administrator=True)
@@ -3819,10 +3819,10 @@ async def fud_rule_on_start():
 # /jail: stop someone talking in general but leave tickets open to them (a Discord timeout blocks tickets too)
 # --------------------------------------------------------------------------- #
 
-JAIL_ROLE_NAME = "Jailed"
+JAIL_ROLE_NAME = "Muted in general"
 JAIL_TIMES = [app_commands.Choice(name=n, value=v) for n, v in
               [("1 hour", 3600), ("6 hours", 6 * 3600), ("24 hours", 86400), ("3 days", 3 * 86400),
-               ("7 days", 7 * 86400), ("Until unjailed", 0)]]
+               ("7 days", 7 * 86400), ("Until lifted", 0)]]
 
 
 def _jail_channels(guild: discord.Guild) -> list:
@@ -3834,53 +3834,130 @@ def _jail_channels(guild: discord.Guild) -> list:
 async def _jail_role(guild: discord.Guild) -> discord.Role:
     role = discord.utils.get(guild.roles, name=JAIL_ROLE_NAME)
     if role is None:
-        role = await guild.create_role(name=JAIL_ROLE_NAME, reason="/jail set up")
+        role = await guild.create_role(name=JAIL_ROLE_NAME, reason="Mute in general set up")
     deny = discord.PermissionOverwrite(send_messages=False, send_messages_in_threads=False,
                                        create_public_threads=False, add_reactions=False)
     for ch in _jail_channels(guild):
         ow = ch.overwrites_for(role)
         if ow.send_messages is not False:
-            await ch.set_permissions(role, overwrite=deny, reason="/jail: jailed members can't talk here")
+            await ch.set_permissions(role, overwrite=deny, reason="Muted members can't talk here")
     return role
 
 
-@bot.tree.command(name="jail", description="Stop someone talking in general (they can still use tickets)")
-@app_commands.describe(member="Who to jail", length="How long", reason="Shown to them and in the log")
-@app_commands.choices(length=JAIL_TIMES)
-async def jail(interaction: discord.Interaction, member: discord.Member, length: app_commands.Choice[int],
-               reason: str = None):
-    if not await _tag_staff_ok(interaction):
-        return
-    if member.bot or is_staff(member):
-        await interaction.response.send_message("You can't jail staff or bots.", ephemeral=True)
-        return
-    await interaction.response.defer(ephemeral=True, thinking=True)
+def _parse_length(text: str) -> tuple[int, str] | None:
+    t = (text or "").strip().lower().replace(" ", "")
+    if t in ("", "perm", "permanent", "forever", "0"):
+        return 0, "until a mod lifts it"
+    m = re.fullmatch(r"(\d+)(m|min|mins|h|hr|hrs|hours?|d|days?|w|weeks?)", t)
+    if not m:
+        return None
+    n, u = int(m.group(1)), m.group(2)[0]
+    secs = n * {"m": 60, "h": 3600, "d": 86400, "w": 604800}[u]
+    word = {"m": "minute", "h": "hour", "d": "day", "w": "week"}[u]
+    return secs, f"{n} {word}{'s' if n != 1 else ''}"
+
+
+async def _do_mute(interaction: discord.Interaction, member: discord.Member, secs: int, label: str,
+                   reason: str | None, said: str | None, said_url: str | None = None):
+    """Shared by /jail and the right-click 'Mute in general' option. Replies to the staff member."""
     guild = interaction.guild
+    if member.bot or is_staff(member):
+        await interaction.followup.send("You can't do this to staff or bots.", ephemeral=True)
+        return
     if not _jail_channels(guild):
         await interaction.followup.send("No general channel set yet. Run `/jailchannel` in general first.",
                                         ephemeral=True)
         return
     try:
         role = await _jail_role(guild)
-        await member.add_roles(role, reason=f"Jailed by {interaction.user}: {reason or 'no reason'}")
+        await member.add_roles(role, reason=f"Muted in general by {interaction.user}: {reason or 'no reason'}")
     except discord.Forbidden:
         await interaction.followup.send("The bot needs **Manage Roles** and **Manage Channels**, and its role must "
-                                        "be above the Jailed role.", ephemeral=True)
+                                        "be above the muted role.", ephemeral=True)
         return
     cfg = fud_store.get(guild.id)
-    until = time.time() + length.value if length.value else 0
-    cfg.setdefault("jailed", {})[str(member.id)] = until
+    cfg.setdefault("jailed", {})[str(member.id)] = time.time() + secs if secs else 0
     fud_store.save()
     where = " ".join(c.mention for c in _jail_channels(guild))
+    e = discord.Embed(title="You've been muted in general",
+                      description=(f"You can't send messages in {where} on **{guild.name}** "
+                                   f"{'for ' + label if secs else label}.\n\n"
+                                   f"You can still open and use tickets if you need help."),
+                      colour=0xDC2626)
+    e.add_field(name="Why", value=(reason or "Breaking the general chat rules.")[:1024], inline=False)
+    if said:
+        quoted = "\n".join("> " + line for line in said[:900].splitlines())
+        e.add_field(name="Your message", value=quoted + (f"\n[Jump to it]({said_url})" if said_url else ""),
+                    inline=False)
+    dm_ok = True
     try:
-        await member.send(f"You've been muted in {where} on **{guild.name}** for {length.name.lower()}"
-                          + (f" ({reason})" if reason else "") + ". You can still open and use tickets.")
+        await member.send(embed=e)
     except discord.HTTPException:
-        pass
-    await fud_log(guild, member, interaction.channel, reason or "", f"Jailed for {length.name.lower()} by "
-                  f"{interaction.user}", 0x7C3AED)
-    await interaction.followup.send(f"{member.mention} is jailed for {length.name.lower()}. They can't talk in "
-                                    f"{where} but can still use tickets.", ephemeral=True)
+        dm_ok = False
+    await fud_log(guild, member, interaction.channel, (said or "") + (f"\n\n**Why:** {reason}" if reason else ""),
+                  f"Muted in general ({label}) by {interaction.user}", 0x7C3AED)
+    await interaction.followup.send(f"{member.mention} is muted in {where} {'for ' + label if secs else label}. "
+                                    f"Tickets still work for them."
+                                    + ("" if dm_ok else "\nTheir DMs are closed, so they didn't get the message."),
+                                    ephemeral=True)
+
+
+@bot.tree.command(name="jail", description="Mute someone in general for a while (tickets still work for them)")
+@app_commands.describe(member="Who to mute", length="How long", reason="Why: shown to them in their DM",
+                       message_link="Link to the message that caused it (shown to them)")
+@app_commands.choices(length=JAIL_TIMES)
+async def jail(interaction: discord.Interaction, member: discord.Member, length: app_commands.Choice[int],
+               reason: str = None, message_link: str = None):
+    if not await _tag_staff_ok(interaction):
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    said = None
+    m = re.search(r"channels/\d+/(\d+)/(\d+)", message_link or "")
+    if m:
+        try:
+            msg = await interaction.guild.get_channel(int(m.group(1))).fetch_message(int(m.group(2)))
+            said = msg.content
+        except Exception:
+            pass
+    label = length.name.lower() if length.value else "until a mod lifts it"
+    await _do_mute(interaction, member, length.value, label, reason, said, message_link if said else None)
+
+
+class MuteModal(discord.ui.Modal, title="Mute in general"):
+    length = discord.ui.TextInput(label="How long (e.g. 1h, 6h, 24h, 3d, 7d, perm)", default="6h", max_length=10)
+    reason = discord.ui.TextInput(label="Why (they'll see this)", style=discord.TextStyle.paragraph,
+                                  default="Posting payout complaints in general instead of opening a ticket.",
+                                  max_length=500)
+
+    def __init__(self, message: discord.Message):
+        super().__init__()
+        self.message = message
+
+    async def on_submit(self, interaction: discord.Interaction):
+        parsed = _parse_length(str(self.length))
+        if parsed is None:
+            await interaction.response.send_message("Couldn't read that length. Use something like 6h, 3d or perm.",
+                                                    ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        member = self.message.author if isinstance(self.message.author, discord.Member) else \
+            await interaction.guild.fetch_member(self.message.author.id)
+        await _do_mute(interaction, member, parsed[0], parsed[1], str(self.reason), self.message.content,
+                       self.message.jump_url)
+        try:
+            await self.message.delete()
+        except discord.HTTPException:
+            pass
+
+
+@app_commands.context_menu(name="Mute in general")
+async def mute_message_menu(interaction: discord.Interaction, message: discord.Message):
+    if not await _tag_staff_ok(interaction):
+        return
+    await interaction.response.send_modal(MuteModal(message))
+
+
+bot.tree.add_command(mute_message_menu)
 
 
 @bot.tree.command(name="unjail", description="Let someone talk in general again")
@@ -3888,11 +3965,11 @@ async def unjail(interaction: discord.Interaction, member: discord.Member):
     if not await _tag_staff_ok(interaction):
         return
     await interaction.response.defer(ephemeral=True, thinking=True)
-    await _release(interaction.guild, member.id, f"Unjailed by {interaction.user}")
+    await _release(interaction.guild, member.id, f"Mute lifted by {interaction.user}")
     await interaction.followup.send(f"{member.mention} can talk in general again.", ephemeral=True)
 
 
-@bot.tree.command(name="jailchannel", description="Add or remove a channel jailed members can't talk in")
+@bot.tree.command(name="jailchannel", description="Add or remove a channel muted members can't talk in")
 @app_commands.choices(state=[app_commands.Choice(name="Add", value="add"), app_commands.Choice(name="Remove", value="remove")])
 async def jailchannel(interaction: discord.Interaction, state: app_commands.Choice[str], channel: discord.TextChannel = None):
     if not await _tag_staff_ok(interaction):
@@ -3915,7 +3992,7 @@ async def jailchannel(interaction: discord.Interaction, state: app_commands.Choi
     except discord.Forbidden:
         await interaction.followup.send("The bot needs **Manage Roles** and **Manage Channels**.", ephemeral=True)
         return
-    await interaction.followup.send("Jailed members can't talk in: " + (" ".join(f"<#{c}>" for c in chans) or "nowhere"),
+    await interaction.followup.send("Muted members can't talk in: " + (" ".join(f"<#{c}>" for c in chans) or "nowhere"),
                                     ephemeral=True)
 
 
@@ -3942,7 +4019,7 @@ async def jail_loop():
             g = bot.get_guild(int(gid))
             for uid, until in list(cfg.get("jailed", {}).items()):
                 if g and until and until <= now:
-                    await _release(g, int(uid), "Jail time is up")
+                    await _release(g, int(uid), "Mute in general ended")
         await asyncio.sleep(60)
 
 
