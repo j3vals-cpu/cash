@@ -17,7 +17,8 @@ RULE_NAME = "Cashed Bot: payout complaints in general"
 DEFAULT_TICKET_CHANNEL = 1565738108698492978
 
 # Spelling tricks are caught too: "pay out", "pay-out", "pay0ut", "p@yout", "pend1ng", "w8ing" etc.
-_PAY = r"p[a@4]y[ ._-]?[o0][uv][tr]s?|p[a@4]ym[e3]nts?|w[i1!]thdr[a@4]w[a-z]*|m[o0]n[e3]y|funds|usd[ct]"
+# Payout words: payout, payment, withdrawal, money, funds, cash out, profits, earnings, payday
+_PAY = r"p[a@4]y[ -]?[o0]u[tr]s?|p[a@4]ym[e3]nts?|w[i1]thdr[a@4]w[a-z]*|m[o0]n[e3]y|funds|cash ?outs?|profits?|earnings|payday"
 _W = r"(?:" + _PAY + r")"
 _PEND = r"p[e3]nd[i1]n[g']?"
 _WAIT = r"(?:w[a@4][i1]t[i1]n[g']?|w8[i1]n[g']?)"
@@ -25,25 +26,24 @@ _N = r"(?:[0-9]+|a few|few|several|many|multiple) *(?:hours?|hrs?|days?|weeks?)"
 # Rust-flavoured regex (AutoMod): no lookarounds, max 10 patterns of 260 chars each. Unicode classes (., \w, \d, \s)
 # blow past Discord's compiled-size limit, so only small ASCII classes are used.
 PATTERNS = [
-    # "payout ... pending / delayed / stuck / taking so long"
-    r"(?i)\b" + _W + r"\b[ -~]{0,40}\b(?:" + _PEND + r"|delay[a-z]*|stuck|late|overdue|taking (?:so |too )?long|been [0-9]+|been (?:ages|forever|days|hours))\b",
+    # "payout ... pending / delayed / stuck / taking so long / been 48 hours"
+    r"(?i)\b" + _W + r"\b[ -~]{0,40}\b(?:" + _PEND + r"|delay[a-z]*|stuck|late|overdue|taking (?:so )?long|been [0-9]+|been (?:ages|forever))\b",
     # "payout ... still pending / still waiting / still nothing"
     r"(?i)\b" + _W + r"\b[ -~]{0,40}\bstill (?:" + _PEND + r"|" + _WAIT + r"|not|no|nothing|hasn'?t|haven'?t)\b",
     # "payout ... not paid / not received / never came"
-    r"(?i)\b" + _W + r"\b[ -~]{0,40}\b(?:not (?:been )?(?:paid|received|sent|processed|approved|arrived)|never (?:came|arrived|received|paid))\b",
-    # "when will my payout come", "where is my money"
-    r"(?i)\b(?:when|where)(?:'s|s| is| are| r| will| tf is)? +(?:(?:my|the|our|is my|are my) +(?:[a-z0-9]+ +)?)?" + _W + r"\b",
-    # "no response on my payout ticket"
-    # ... and "payout where", "payout when??"
-    r"(?i)\bno (?:reply|response|answer|update|one)\b[ -~]{0,30}\b(?:" + _PAY + r"|ticket)\b|\bp[a@4]y[ ._-]?[o0][uv][tr]s? +(?:where|wen|when)\b",
-    # "waiting ... for my payout", "pending payout"
-    r"(?i)\b(?:" + _WAIT + r"|" + _PEND + r")\b[ -~]{0,40}\b" + _W + r"\b",
+    r"(?i)\b" + _W + r"\b[ -~]{0,40}\b(?:not (?:been )?(?:paid|received|sent|processed|arrived)|never (?:came|arrived|received|paid))\b",
+    # "when will my payout come", "where's payouts", "when do i get my money"
+    r"(?i)\b(?:when|where)(?:'s|s)?(?: (?:is|are|r|will|do|am)(?: i| we)?(?: get| getting| receive)?)? +(?:(?:my|the|our) +(?:[a-z0-9]+ +)?)?" + _W + r"\b",
+    # "no response on my payout ticket", "payout where", "payout when??"
+    r"(?i)\bno (?:reply|response|answer|update|one)\b[ -~]{0,30}\b(?:" + _PAY + r"|ticket)\b|\bp[a@4]y[ -]?[o0]u[tr]s? +(?:where|wen|when)\b",
+    # "waiting ... for my payout", "pending payout", "still waiting to get paid"
+    r"(?i)\b(?:" + _WAIT + r"|" + _PEND + r")\b[ -~]{0,40}\b(?:" + _PAY + r"|get paid|be paid)\b",
     # "haven't received my payout", "still not paid"
-    r"(?i)\b(?:hasn'?t|haven'?t|not|never|didn'?t) +(?:yet +)?(?:been +)?(?:got|gotten|get|receive[ds]?|paid|arrived|came|sent)\b[ -~]{0,30}\b(?:" + _PAY + r"|yet|paid)\b",
-    # "6 hours and still pending", "3 days no payout"
-    r"(?i)\b" + _N + r"\b[ -~]{0,30}\b(?:" + _PEND + r"|" + _WAIT + r"|still|no reply|no response|nothing|no p[a@4]y[a-z0 ]*)\b",
-    # "pending for 6 hours", "waiting 3 days"
-    r"(?i)\b(?:" + _PEND + r"|" + _WAIT + r") +(?:for +)?(?:over +|more than +)?" + _N + r"\b",
+    r"(?i)\b(?:hasn'?t|haven'?t|not|never|didn'?t) +(?:yet +)?(?:been +)?(?:got|get|receive[ds]?|paid|arrived|came)\b[ -~]{0,30}\b(?:" + _PAY + r"|yet|paid)\b",
+    # "6 hours and still pending", "3 days no payout", "haven't been paid"
+    r"(?i)\b" + _N + r"\b[ -~]{0,30}\b(?:" + _PEND + r"|" + _WAIT + r"|still|no re(?:ply|sponse)|nothing|no p[a@4]y[a-z0 ]*)\b|\b(?:hasn'?t|haven'?t|not) +(?:yet +)?been paid\b",
+    # "pending for 6 hours", "when am i getting paid", "why haven't i been paid"
+    r"(?i)\b(?:" + _PEND + r"|" + _WAIT + r") +(?:for +)?(?:over +|more than +)?" + _N + r"\b|\b(?:when|why)\b[ -~]{0,20}\b(?:get|getting|be|being|been|not) paid\b",
     # FUD: "cashed is a scam", "they won't pay"
     r"(?i)\b(?:cashed|they|firm|you guys|this)\b[ -~]{0,30}\b(?:sc[a@4]m[a-z]*|rug[a-z]*|fraud[a-z]*|won'?t pay|wont pay|don'?t pay|doesn'?t pay|never pays?|not paying|refus[a-z]* to pay|steal[a-z]*)\b",
 ]
