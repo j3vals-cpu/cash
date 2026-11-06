@@ -287,6 +287,7 @@ class TicketBot(discord.Client):
                 c.guild_only = True
                 c.default_permissions = None  # everyone in your private server can use them
                 self.tree.add_command(c, guild=og)
+            self.tree.add_command(fud_group, guild=og, override=True)  # test the general filter in the office server
         for cmd in self.tree.get_commands():
             cmd.default_permissions = discord.Permissions(administrator=True)
             cmd.guild_only = True
@@ -306,6 +307,7 @@ class TicketBot(discord.Client):
         self.loop.create_task(briefing_loop())
         self.loop.create_task(extras.timer_loop())
         self.loop.create_task(tag_rule_on_start())
+        self.loop.create_task(fud_rule_on_start())
         self.loop.create_task(ultra_voice.ensure())  # download Ultra's voice in the background
         # Public API for the website's live payout feed (needs Railway public networking)
         import web_api
@@ -3519,6 +3521,132 @@ async def tag_message(interaction: discord.Interaction, text: app_commands.Range
 
 
 bot.tree.add_command(tag_group)
+
+
+# --------------------------------------------------------------------------- #
+# /fud: block payout complaints in general ("payout pending 6 hours") and privately point them to a ticket
+# --------------------------------------------------------------------------- #
+
+import general_filter
+
+fud_store = general_filter.FilterStore(DATA_DIR)
+fud_group = app_commands.Group(name="fud", description="Keep payout complaints out of general chat")
+
+
+async def _fud_apply(guild: discord.Guild) -> str | None:
+    return await general_filter.apply_rule(bot, guild, fud_store.get(guild.id), STAFF_ROLE_IDS)
+
+
+@fud_group.command(name="on", description="Block payout complaints in this channel (or the one you pick)")
+@app_commands.describe(channel="Channel to filter (default: this one)")
+async def fud_on(interaction: discord.Interaction, channel: discord.TextChannel = None):
+    if not await _tag_staff_ok(interaction):
+        return
+    channel = channel or interaction.channel
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    cfg = fud_store.get(interaction.guild_id)
+    if channel.id not in cfg["channels"]:
+        cfg["channels"].append(channel.id)
+        fud_store.save()
+    err = await _fud_apply(interaction.guild)
+    await interaction.followup.send(
+        err or f"Filter is on in {channel.mention}. Payout complaints get blocked and the sender privately sees:\n"
+               f"*{general_filter.notice_text(bot, cfg)}*\n\nAdmins and staff are never blocked, so test it "
+               f"with a normal member account. Use `/fud test` to check a message.", ephemeral=True)
+
+
+@fud_group.command(name="off", description="Stop filtering this channel (or the one you pick)")
+async def fud_off(interaction: discord.Interaction, channel: discord.TextChannel = None):
+    if not await _tag_staff_ok(interaction):
+        return
+    channel = channel or interaction.channel
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    cfg = fud_store.get(interaction.guild_id)
+    if channel.id in cfg["channels"]:
+        cfg["channels"].remove(channel.id)
+        fud_store.save()
+    err = await _fud_apply(interaction.guild)
+    await interaction.followup.send(err or f"Filter is off in {channel.mention}.", ephemeral=True)
+
+
+@fud_group.command(name="ticketchannel", description="Which channel the message tells people to open a payout ticket in")
+async def fud_ticketchannel(interaction: discord.Interaction, channel: discord.TextChannel):
+    if not await _tag_staff_ok(interaction):
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    cfg = fud_store.get(interaction.guild_id)
+    cfg["ticket_channel"] = channel.id
+    fud_store.save()
+    err = await _fud_apply(interaction.guild)
+    await interaction.followup.send(err or f"People now see: *{general_filter.notice_text(bot, cfg)}*", ephemeral=True)
+
+
+@fud_group.command(name="test", description="Check whether a message would be blocked")
+async def fud_test(interaction: discord.Interaction, message: str):
+    if not await _tag_staff_ok(interaction):
+        return
+    hit = general_filter.would_block(message)
+    await interaction.response.send_message(
+        ("**Blocked.** They'd privately see:\n*" + general_filter.notice_text(bot, fud_store.get(interaction.guild_id))
+         + "*") if hit else "**Allowed.** That message would go through.", ephemeral=True)
+
+
+@fud_group.command(name="status", description="Where the filter is on and the message people see")
+async def fud_status(interaction: discord.Interaction):
+    if not await _tag_staff_ok(interaction):
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    cfg = fud_store.get(interaction.guild_id)
+    err = await _fud_apply(interaction.guild)  # also re-applies the rule
+    chans = " ".join(f"<#{c}>" for c in cfg["channels"]) or "nowhere"
+    await interaction.followup.send(f"**Filtering:** {chans}\n**Message they see:** "
+                                    f"{general_filter.notice_text(bot, cfg)}" + (f"\n\n{err}" if err else ""),
+                                    ephemeral=True)
+
+
+bot.tree.add_command(fud_group)
+
+_fud_pending: set[int] = set()
+
+
+async def _fud_refresh(guild: discord.Guild):
+    """New or moved channels must be exempted again so the filter stays limited to general."""
+    if not guild or not fud_store.get(guild.id)["channels"] or guild.id in _fud_pending:
+        return
+    _fud_pending.add(guild.id)
+    try:
+        await asyncio.sleep(10)  # batch bursts of channel changes (e.g. several tickets opening)
+        err = await _fud_apply(guild)
+        if err:
+            log.warning("General filter not updated in %s: %s", guild.name, err)
+    finally:
+        _fud_pending.discard(guild.id)
+
+
+@bot.event
+async def on_guild_channel_create(channel):
+    bot.loop.create_task(_fud_refresh(channel.guild))
+
+
+@bot.event
+async def on_guild_channel_delete(channel):
+    bot.loop.create_task(_fud_refresh(channel.guild))
+
+
+@bot.event
+async def on_guild_channel_update(before, after):
+    if before.category_id != after.category_id:
+        bot.loop.create_task(_fud_refresh(after.guild))
+
+
+async def fud_rule_on_start():
+    await bot.wait_until_ready()
+    for gid, cfg in list(fud_store.guilds.items()):
+        g = bot.get_guild(int(gid))
+        if g and cfg.get("channels"):
+            err = await _fud_apply(g)
+            if err:
+                log.warning("General filter not active in %s: %s", g.name, err)
 
 
 # --------------------------------------------------------------------------- #
