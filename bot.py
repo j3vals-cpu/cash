@@ -3890,8 +3890,15 @@ async def _do_mute(interaction: discord.Interaction, member: discord.Member, sec
                    reason: str | None, said: str | None, said_url: str | None = None):
     """Shared by /jail and the right-click 'Mute in general' option. Replies to the staff member."""
     guild = interaction.guild
-    if member.bot or is_staff(member):
-        await interaction.followup.send("You can't do this to staff or bots.", ephemeral=True)
+    p = member.guild_permissions
+    staff_role = next((r for r in member.roles if r.id in STAFF_ROLE_IDS), None)
+    why = ("they're a bot" if member.bot else
+           f"they have the staff role {staff_role.mention}" if staff_role else
+           "they're an admin" if p.administrator else
+           "they have Manage Server / Timeout Members permissions" if (p.manage_guild or p.moderate_members) else None)
+    if why:
+        await interaction.followup.send(f"Can't mute {member.mention}: {why}.", ephemeral=True,
+                                        allowed_mentions=discord.AllowedMentions.none())
         return
     if not _jail_channels(guild):
         await interaction.followup.send("No general channel set yet. Run `/jailchannel` in general first.",
