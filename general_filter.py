@@ -17,7 +17,7 @@ RULE_NAME = "Cashed Bot: payout complaints in general"
 DEFAULT_TICKET_CHANNEL = 1565738108698492978
 
 # Spelling tricks are caught too: "pay out", "pay-out", "pay0ut", "p@yout", "pend1ng", "w8ing" etc.
-_PAY = r"p[a@4]y[ ._-]?[o0][uv]ts?|p[a@4]ym[e3]nts?|w[i1!]thdr[a@4]w[a-z]*|m[o0]n[e3]y|funds|usd[ct]"
+_PAY = r"p[a@4]y[ ._-]?[o0][uv][tr]s?|p[a@4]ym[e3]nts?|w[i1!]thdr[a@4]w[a-z]*|m[o0]n[e3]y|funds|usd[ct]"
 _W = r"(?:" + _PAY + r")"
 _PEND = r"p[e3]nd[i1]n[g']?"
 _WAIT = r"(?:w[a@4][i1]t[i1]n[g']?|w8[i1]n[g']?)"
@@ -26,13 +26,13 @@ _N = r"(?:[0-9]+|a few|few|several|many|multiple) *(?:hours?|hrs?|days?|weeks?)"
 # blow past Discord's compiled-size limit, so only small ASCII classes are used.
 PATTERNS = [
     # "payout ... pending / delayed / stuck / taking so long"
-    r"(?i)\b" + _W + r"\b[ -~]{0,40}\b(?:" + _PEND + r"|delay[a-z]*|stuck|late|overdue|taking (?:so |too )?long)\b",
+    r"(?i)\b" + _W + r"\b[ -~]{0,40}\b(?:" + _PEND + r"|delay[a-z]*|stuck|late|overdue|taking (?:so |too )?long|been [0-9]+|been (?:ages|forever|days|hours))\b",
     # "payout ... still pending / still waiting / still nothing"
     r"(?i)\b" + _W + r"\b[ -~]{0,40}\bstill (?:" + _PEND + r"|" + _WAIT + r"|not|no|nothing|hasn'?t|haven'?t)\b",
     # "payout ... not paid / not received / never came"
     r"(?i)\b" + _W + r"\b[ -~]{0,40}\b(?:not (?:been )?(?:paid|received|sent|processed|approved|arrived)|never (?:came|arrived|received|paid))\b",
     # "when will my payout come", "where is my money"
-    r"(?i)\b(?:when|where)(?:'s|s| is| will| does| tf is) +(?:my|the|our) +(?:[a-z0-9]+ +)?" + _W + r"\b",
+    r"(?i)\b(?:when|where)(?:'s|s| is| will| does| tf is)? +(?:my|the|our|is my) +(?:[a-z0-9]+ +)?" + _W + r"\b",
     # "no response on my payout ticket"
     r"(?i)\bno (?:reply|response|answer|update|one)\b[ -~]{0,30}\b(?:" + _PAY + r"|ticket)\b",
     # "waiting ... for my payout", "pending payout"
