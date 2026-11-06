@@ -3591,6 +3591,18 @@ async def fud_tags(interaction: discord.Interaction, state: app_commands.Choice[
     await interaction.followup.send(err or msg, ephemeral=True)
 
 
+@fud_group.command(name="logchannel", description="Where blocked and deleted messages get logged for staff")
+async def fud_logchannel(interaction: discord.Interaction, channel: discord.TextChannel):
+    if not await _tag_staff_ok(interaction):
+        return
+    cfg = fud_store.get(interaction.guild_id)
+    cfg["log_channel"] = channel.id
+    fud_store.save()
+    await interaction.response.send_message(
+        f"Blocked and deleted messages from the filtered channels will be logged in {channel.mention}. "
+        f"Make sure only staff can see that channel.", ephemeral=True)
+
+
 @fud_group.command(name="ticketchannel", description="Which channel the message tells people to open a payout ticket in")
 async def fud_ticketchannel(interaction: discord.Interaction, channel: discord.TextChannel):
     if not await _tag_staff_ok(interaction):
@@ -3690,10 +3702,13 @@ async def tag_bypass_check(message: discord.Message):
         strikes = 0
     strikes += 1
     _tag_strikes[message.author.id] = (strikes, now)
+    _fud_bot_deleted.add(message.id)
     try:
         await message.delete()
     except discord.HTTPException:
         pass
+    await fud_log(message.guild, message.author, message.channel, message.content,
+                  "Spam-tagging: " + ("warned" if strikes == 1 else "6 hour timeout"), 0xF59E0B if strikes == 1 else 0xDC2626)
     if strikes == 1:
         text = (f"{message.author.mention} please don't spam tags. You can tag one person at a time, not one after "
                 f"another. Do it again and you'll get a **6 hour timeout**.")
@@ -3709,6 +3724,73 @@ async def tag_bypass_check(message: discord.Message):
         await message.channel.send(text, delete_after=15, allowed_mentions=discord.AllowedMentions(users=True))
     except discord.HTTPException:
         pass
+
+
+_fud_bot_deleted: set[int] = set()
+_fud_rule_names: dict[int, str] = {}
+
+
+async def fud_log(guild, user, channel, content, reason, colour=0x6B7280):
+    """Post a blocked/deleted message to the staff log channel (/fud logchannel)."""
+    cid = fud_store.get(guild.id).get("log_channel") if guild else None
+    ch = guild.get_channel(int(cid)) if cid else None
+    if ch is None:
+        return
+    e = discord.Embed(description=(content or "*(no text)*")[:3900], colour=colour,
+                      timestamp=datetime.now(timezone.utc))
+    e.set_author(name=reason)
+    uname = getattr(user, "name", None) or str(user)
+    uid = getattr(user, "id", user)
+    e.add_field(name="User", value=f"<@{uid}> · {uname} · `{uid}`", inline=False)
+    if channel is not None:
+        e.add_field(name="Channel", value=getattr(channel, "mention", str(channel)), inline=True)
+    try:
+        await ch.send(embed=e, allowed_mentions=discord.AllowedMentions.none())
+    except discord.HTTPException:
+        log.warning("Couldn't write to the filter log channel in %s", guild.name)
+
+
+@bot.event
+async def on_automod_action(execution: discord.AutoModAction):
+    """Log what the payout filter / tag limit blocked, so staff can see it (only the sender sees the notice)."""
+    if execution.action.type != discord.AutoModRuleActionType.block_message:
+        return
+    guild = bot.get_guild(execution.guild_id)
+    if guild is None:
+        return
+    name = _fud_rule_names.get(execution.rule_id)
+    if name is None:
+        try:
+            name = (await guild.fetch_automod_rule(execution.rule_id)).name
+        except discord.HTTPException:
+            return
+        _fud_rule_names[execution.rule_id] = name
+    if name == general_filter.RULE_NAME:
+        reason, colour = "Blocked: payout complaint in general", 0xDC2626
+    elif name == general_filter.TAG_RULE:
+        reason, colour = "Blocked: more than one tag", 0xF59E0B
+    else:
+        return
+    user = execution.member or guild.get_member(execution.user_id) or execution.user_id
+    channel = guild.get_channel(execution.channel_id) if execution.channel_id else None
+    await fud_log(guild, user, channel, execution.content, reason, colour)
+
+
+async def fud_log_self_delete(payload):
+    """Messages deleted in the filtered channels (by the sender or a mod), from the bot's message cache."""
+    if payload.message_id in _fud_bot_deleted:
+        _fud_bot_deleted.discard(payload.message_id)
+        return
+    if not payload.guild_id:
+        return
+    cfg = fud_store.get(payload.guild_id)
+    if payload.channel_id not in set(cfg["channels"]) | set(cfg["tag_channels"]) or not cfg.get("log_channel"):
+        return
+    m = payload.cached_message
+    if m is None or m.author.bot:
+        return
+    await fud_log(m.guild, m.author, m.channel, m.content + ("\n\n*(had attachments)*" if m.attachments else ""),
+                  "Deleted message", 0x6B7280)
 
 
 FUD_TEST_TICKET_CHANNEL =1566604554890379395  # testing: point the notice at this channel in its own server
@@ -5953,6 +6035,7 @@ ultra_voice = UltraVoice()
 @bot.event
 async def on_raw_message_delete(payload):
     tracker.posts.pop(payload.message_id, None)
+    await fud_log_self_delete(payload)
 
 
 @bot.event
