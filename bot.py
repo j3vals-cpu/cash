@@ -3907,6 +3907,10 @@ async def _do_mute(interaction: discord.Interaction, member: discord.Member, sec
     try:
         role = await _jail_role(guild)
         await member.add_roles(role, reason=f"Muted in general by {interaction.user}: {reason or 'no reason'}")
+        # A role deny loses to any other role that's allowed to talk there, so also deny them personally
+        for ch in _jail_channels(guild):
+            await ch.set_permissions(member, send_messages=False, send_messages_in_threads=False,
+                                     add_reactions=False, reason="Muted in general")
     except discord.Forbidden:
         await interaction.followup.send("The bot needs **Manage Roles** and **Manage Channels**, and its role must "
                                         "be above the muted role.", ephemeral=True)
@@ -3930,11 +3934,18 @@ async def _do_mute(interaction: discord.Interaction, member: discord.Member, sec
         await member.send(embed=e)
     except discord.HTTPException:
         dm_ok = False
+        tk = open_ticket_of(guild, member.id)  # DMs closed: put it in their ticket if they have one
+        if tk:
+            try:
+                await tk.send(content=member.mention, embed=e)
+                dm_ok = True
+            except discord.HTTPException:
+                pass
     await fud_log(guild, member, interaction.channel, (said or "") + (f"\n\n**Why:** {reason}" if reason else ""),
                   f"Muted in general ({label}) by {interaction.user}", 0x7C3AED)
     await interaction.followup.send(f"{member.mention} is muted in {where} {'for ' + label if secs else label}. "
                                     f"Tickets still work for them."
-                                    + ("" if dm_ok else "\nTheir DMs are closed, so they didn't get the message."),
+                                    + ("" if dm_ok else "\nTheir DMs are closed and they have no open ticket, so they didn't get the message."),
                                     ephemeral=True)
 
 
@@ -4041,6 +4052,9 @@ async def _release(guild: discord.Guild, user_id: int, why: str):
         member = guild.get_member(user_id) or await guild.fetch_member(user_id)
         if role:
             await member.remove_roles(role, reason=why)
+        for ch in _jail_channels(guild):
+            if member in ch.overwrites:
+                await ch.set_permissions(member, overwrite=None, reason=why)
         await fud_log(guild, member, None, "", why, 0x16A34A)
     except discord.HTTPException:
         pass
