@@ -16,27 +16,28 @@ log = logging.getLogger("ticket-bot")
 RULE_NAME = "Cashed Bot: payout complaints in general"
 DEFAULT_TICKET_CHANNEL = 1565738108698492978
 
-_W = r"(?:payouts?|withdraw\w*|withdrawals?|payments?|money|funds|usdc|usdt)"
-# Rust-flavoured regex (AutoMod): no lookarounds, max 10 patterns of 260 chars each.
+_W = r"(?:payouts?|withdraw[a-z]*|withdrawals?|payments?|money|funds|usdc|usdt)"
+# Rust-flavoured regex (AutoMod): no lookarounds, max 10 patterns of 260 chars each. Unicode classes (., \w, \d, \s)
+# blow past Discord's compiled-size limit, so only small ASCII classes are used.
 PATTERNS = [
     # "payout ... pending / delayed / stuck / taking so long"
-    r"(?i)\b" + _W + r"\b.{0,40}\b(?:pending|delay\w*|stuck|late|overdue|taking (?:so |too )?long|no (?:reply|response|answer|update))\b",
+    r"(?i)\b" + _W + r"\b[ -~]{0,40}\b(?:pending|delay[a-z]*|stuck|late|overdue|taking (?:so |too )?long|no (?:reply|response|answer|update))\b",
     # "payout ... still not paid / not received / never came"
-    r"(?i)\b" + _W + r"\b.{0,40}\b(?:still (?:pending|waiting|not|no|nothing|hasn'?t|haven'?t)|not (?:been )?(?:paid|received|sent|processed|approved|arrived)|never (?:came|arrived|received|paid))\b",
+    r"(?i)\b" + _W + r"\b[ -~]{0,40}\b(?:still (?:pending|waiting|not|no|nothing|hasn'?t|haven'?t)|not (?:been )?(?:paid|received|sent|processed|approved|arrived)|never (?:came|arrived|received|paid))\b",
     # "when will my payout come", "where is my money"
-    r"(?i)\b(?:when|where)(?:'s|s| is| will| does| tf is| the hell is)\s+(?:my|the|our)\s+(?:\w+\s+)?" + _W + r"\b",
+    r"(?i)\b(?:when|where)(?:'s|s| is| will| does| tf is| the hell is) +(?:my|the|our) +(?:[a-z0-9]+ +)?" + _W + r"\b",
     # "no response on my payout ticket"
-    r"(?i)\bno (?:reply|response|answer|update|one)\b.{0,30}\b(?:" + _W[3:-1] + r"|ticket)\b",
+    r"(?i)\bno (?:reply|response|answer|update|one)\b[ -~]{0,30}\b(?:" + _W[3:-1] + r"|ticket)\b",
     # "waiting ... for my payout", "pending payout"
-    r"(?i)\b(?:still waiting|been waiting|waiting|pending)\b.{0,40}\b" + _W + r"\b",
+    r"(?i)\b(?:still waiting|been waiting|waiting|pending)\b[ -~]{0,40}\b" + _W + r"\b",
     # "haven't received my payout", "still not paid"
-    r"(?i)\b(?:hasn'?t|haven'?t|have not|has not|not|never|didn'?t|did not|still no|still not)\s+(?:yet\s+)?(?:been\s+)?(?:got|gotten|get|receive[ds]?|paid|arrived|came|sent)\b.{0,30}\b(?:" + _W[3:-1] + r"|yet|paid)\b",
+    r"(?i)\b(?:hasn'?t|haven'?t|have not|has not|not|never|didn'?t|did not|still not) +(?:yet +)?(?:been +)?(?:got|gotten|get|receive[ds]?|paid|arrived|came|sent)\b[ -~]{0,30}\b(?:" + _W[3:-1] + r"|yet|paid)\b",
     # "6 hours and still pending", "3 days no payout"
-    r"(?i)\b(?:\d+|a few|few|several|many|multiple)\s*(?:hours?|hrs?|days?|weeks?)\b.{0,30}\b(?:pending|waiting|still|no payout|no reply|no response|nothing)\b",
+    r"(?i)\b(?:[0-9]+|a few|few|several|many|multiple) *(?:hours?|hrs?|days?|weeks?)\b[ -~]{0,30}\b(?:pending|waiting|still|no payout|no reply|no response|nothing)\b",
     # "pending for 6 hours", "waiting 3 days"
-    r"(?i)\b(?:pending|waiting)\s+(?:for\s+)?(?:over\s+|more than\s+)?(?:\d+|a few|few|several|many|multiple)\s*(?:hours?|hrs?|days?|weeks?)\b",
+    r"(?i)\b(?:pending|waiting) +(?:for +)?(?:over +|more than +)?(?:[0-9]+|a few|few|several|many|multiple) *(?:hours?|hrs?|days?|weeks?)\b",
     # FUD: "cashed is a scam", "they won't pay"
-    r"(?i)\b(?:cashed|they|firm|you guys|this)\b.{0,30}\b(?:scam\w*|rug\w*|fraud\w*|won'?t pay|wont pay|don'?t pay|doesn'?t pay|never pays?|not paying|refus\w* to pay|steal\w*)\b",
+    r"(?i)\b(?:cashed|they|firm|you guys|this)\b[ -~]{0,30}\b(?:scam[a-z]*|rug[a-z]*|fraud[a-z]*|won'?t pay|wont pay|don'?t pay|doesn'?t pay|never pays?|not paying|refus[a-z]* to pay|steal[a-z]*)\b",
 ]
 _COMPILED = [re.compile(p) for p in PATTERNS]
 
