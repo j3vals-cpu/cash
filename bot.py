@@ -2910,25 +2910,59 @@ HEDGE_KEYS_DEFAULT = {  # account IDs and Cashed user IDs from the evidence revi
 }
 
 
-def load_hedge_watchlist() -> tuple[dict, dict]:
-    """(names: username -> why, keys: email / account ID / Cashed user ID -> username)"""
+def _nov7() -> dict:
+    """Names from the 7 Nov 2026 trading review: 'hedge' = own-account cases, 'review' = shared-IP pairs only."""
+    try:
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "hedge_review_2026_11_07.json"),
+                  encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        log.exception("Couldn't read hedge_review_2026_11_07.json")
+        return {"hedge": {}, "review": {}}
+
+
+HEDGE_NOV7 = _nov7()
+
+
+def _hedge_file() -> dict:
     try:
         with open(HEDGE_WATCH_FILE, encoding="utf-8") as f:
             d = json.load(f)
-        if "names" not in d:  # older file: just names
-            d = {"names": d, "keys": {}}
-        keys = dict(HEDGE_KEYS_DEFAULT)
-        keys.update({k.lower(): v for k, v in d.get("keys", {}).items()})
-        return {k.lower(): v for k, v in d["names"].items()}, keys
+        return d if "names" in d else {"names": d, "keys": {}}  # older file: just names
+    except FileNotFoundError:
+        return {}
     except Exception:
-        return dict(HEDGE_WATCHLIST_DEFAULT), dict(HEDGE_KEYS_DEFAULT)
+        log.exception("Couldn't read the hedge watchlist file")
+        return {}
 
 
-def save_hedge_watchlist(names: dict, keys: dict):
+def load_hedge_watchlist() -> tuple[dict, dict]:
+    """(names: username -> why, keys: email / account ID / Cashed user ID -> username)"""
+    names = dict(HEDGE_WATCHLIST_DEFAULT)
+    for k, v in HEDGE_NOV7.get("hedge", {}).items():
+        names.setdefault(k, v)
+    keys = dict(HEDGE_KEYS_DEFAULT)
+    d = _hedge_file()
+    names.update({k.lower(): v for k, v in d.get("names", {}).items()})
+    keys.update({k.lower(): v for k, v in d.get("keys", {}).items()})
+    for k in d.get("removed", []):
+        names.pop(k, None)
+        keys.pop(k, None)
+    return names, keys
+
+
+def load_hedge_review(watch: dict) -> dict:
+    """Weaker links (shared IP only): shown for a manual check, never auto-hedged."""
+    removed = set(_hedge_file().get("removed", []))
+    return {k: v for k, v in HEDGE_NOV7.get("review", {}).items() if k not in watch and k not in removed}
+
+
+def save_hedge_watchlist(names: dict, keys: dict, removed: set | None = None):
     os.makedirs(DATA_DIR, exist_ok=True)
     extra = {k: v for k, v in keys.items() if HEDGE_KEYS_DEFAULT.get(k) != v}
+    gone = (set(_hedge_file().get("removed", [])) | set(removed or ())) - set(names) - set(keys)
     with open(HEDGE_WATCH_FILE, "w", encoding="utf-8") as f:
-        json.dump({"names": names, "keys": extra}, f)
+        json.dump({"names": names, "keys": extra, "removed": sorted(gone)}, f)
 
 
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
@@ -2945,17 +2979,58 @@ def _name_tokens(text: str) -> set[str]:
     return toks
 
 
-async def hedge_matches(guild: discord.Guild, watch: dict, keys: dict) -> list[dict]:
-    names = set(watch)
+_LEET = str.maketrans("013457@$", "oieastas")
+_GENERIC = {"payout", "payouts", "ticket", "bug", "pg", "cashed", "closed", "hedge", "risk", "the", "official"}
+
+
+def _norm(n: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", (n or "").lower().translate(_LEET))
+
+
+def _close(a: str, b: str) -> bool:
+    """Loose username match: posi_cyb ~ posicyb, Glitchin0 ~ glitchino, goku364747 ~ goku3647470."""
+    na, nb = _norm(a), _norm(b)
+    if not na or not nb:
+        return False
+    if na == nb:
+        return True
+    short, long_ = sorted((na, nb), key=len)
+    if len(short) >= 5 and short in long_:
+        return True
+    if len(short) >= 6:
+        import difflib
+        return difflib.SequenceMatcher(None, na, nb).ratio() >= 0.85
+    return False
+
+
+async def hedge_matches(guild: discord.Guild, watch: dict, keys: dict, review: dict | None = None) -> list[dict]:
+    """Tickets matching the watchlist. Tier 'hedge' = exact match on a hedger (safe for Hedge all), 'check' = only a
+    close/partial name match on a hedger, 'review' = shared-IP names only (look manually)."""
+    review = review or {}
+    names = set(watch) | set(review)
     found = []
     sem = asyncio.Semaphore(5)
 
     async def check(ch):
-        why = []
-        if names & _name_tokens(base_name(ch.name)):
-            why.append(("ticket name", sorted(names & _name_tokens(base_name(ch.name)))))
+        hits = []   # (how, username, exact?)
+        cands = []  # (where, text) to try close matches on
+
+        def exact_or_close(where, text):
+            t = (text or "").lower().lstrip("@")
+            if not t:
+                return
+            if t in names:
+                hits.append((where, t, True))
+            else:
+                cands.append((where, t))
+
+        for tok in _name_tokens(base_name(ch.name)):
+            if tok in names:
+                hits.append(("ticket name", tok, True))
+        cands.append(("ticket name", re.sub(r"^(?:payout|bug|pg)[-_]+", "", base_name(ch.name).lower())))
         uid = re.search(r"uid:(\d+)", ch.topic or "")
         opener = None
+        member = None
         async with sem:
             try:
                 async for m in ch.history(limit=30, oldest_first=True):
@@ -2964,21 +3039,19 @@ async def hedge_matches(guild: discord.Guild, watch: dict, keys: dict) -> list[d
                     text = m.content or ""
                     for e in m.embeds:
                         text += " " + (e.description or "") + " " + " ".join(f"{f.name} {f.value}" for f in e.fields)
-                    for line in re.findall(r"(?i)\b(?:user(?:name)?|account)\b[\s*:_\-]{1,8}@?([A-Za-z0-9_.]{2,40})", text):
-                        if line.lower() in names:
-                            why.append(("payout form", [line.lower()]))
-                    for found_key, label in ((x.lower(), "email") for x in EMAIL_RE.findall(text)):
-                        if found_key in keys:
-                            why.append((label, [keys[found_key]]))
-                    for found_key in (x.lower() for x in ACCOUNT_ID_RE.findall(text)):
-                        if found_key in keys:
-                            why.append(("account ID", [keys[found_key]]))
-                    for found_key in USER_ID_RE.findall(text):
-                        if found_key in keys:
-                            why.append(("Cashed user ID", [keys[found_key]]))
+                    for u in re.findall(r"(?i)\b(?:user(?:name)?|account)\b[\s*:_\-]{1,8}@?([A-Za-z0-9_.]{2,40})", text):
+                        exact_or_close("payout form", u)
+                    for k in (x.lower() for x in EMAIL_RE.findall(text)):
+                        if k in keys:
+                            hits.append(("email", keys[k], True))
+                    for k in (x.lower() for x in ACCOUNT_ID_RE.findall(text)):
+                        if k in keys:
+                            hits.append(("account ID", keys[k], True))
+                    for k in USER_ID_RE.findall(text):
+                        if k in keys:
+                            hits.append(("Cashed user ID", keys[k], True))
             except (discord.Forbidden, discord.HTTPException):
                 pass
-            member = None
             if uid:
                 try:
                     member = guild.get_member(int(uid.group(1))) or await guild.fetch_member(int(uid.group(1)))
@@ -2988,24 +3061,37 @@ async def hedge_matches(guild: discord.Guild, watch: dict, keys: dict) -> list[d
             if member is not None:
                 info = await cashed_lookup(member.id)  # their linked Cashed account (Discord link on cashed.fun)
                 if info and info.get("linked"):
-                    lu = (info.get("username") or "").lower()
+                    exact_or_close("linked Cashed account", info.get("username") or "")
                     le = (info.get("email") or "").lower()
-                    if lu in names:
-                        why.append(("linked Cashed account", [lu]))
                     if le and le in keys:
-                        why.append(("linked email", [keys[le]]))
-                disc = {(getattr(member, a, None) or "").lower() for a in ("name", "global_name", "display_name", "nick")}
-                hit = sorted(n for n in names if n in disc)
-                if hit:
-                    why.append(("Discord name", hit))
-        if why:
-            users = sorted({u for _, us in why for u in us})
-            found.append({"ch": ch, "users": users, "how": sorted({w for w, _ in why}),
-                          "opener": member.mention if member is not None else "?"})
+                        hits.append(("linked email", keys[le], True))
+                for a in ("name", "global_name", "display_name", "nick"):
+                    exact_or_close("Discord name", getattr(member, a, None) or "")
+        if not any(ex for _, _, ex in hits):  # nothing exact: try close matches
+            seen = set()
+            for where, t in cands:
+                if _norm(t) in _GENERIC or (where, t) in seen:
+                    continue
+                seen.add((where, t))
+                for n in names:
+                    if _close(t, n):
+                        hits.append((f"close {where}: {t} ≈ {n}", n, False))
+        if not hits:
+            return
+        users = sorted({u for _, u, _ in hits})
+        strong = {u for _, u, ex in hits if ex}
+        if any(u in watch for u in strong):
+            tier = "hedge"
+        elif any(u in watch for u in users):
+            tier = "check"
+        else:
+            tier = "review"
+        found.append({"ch": ch, "users": users, "how": sorted({w for w, _, _ in hits}), "tier": tier,
+                      "opener": member.mention if member is not None else "?"})
 
     chans = [c for c in guild.text_channels if is_ticket_channel(c) and c.category_id != HEDGE_CATEGORY_ID]
     await asyncio.gather(*(check(c) for c in chans))
-    found.sort(key=lambda f: f["ch"].name)
+    found.sort(key=lambda f: ({"hedge": 0, "check": 1, "review": 2}[f["tier"]], f["ch"].name))
     return found
 
 
@@ -3027,7 +3113,7 @@ class HedgeScanView(discord.ui.View):
             await interaction.followup.send("I can't find the risk category - check `HEDGE_CATEGORY_ID`.", ephemeral=True)
             return
         done, failed = [], []
-        for m in self.matches:
+        for m in [m for m in self.matches if m.get("tier", "hedge") == "hedge"]:
             reason = "Hedging watchlist: " + "; ".join(f"@{u}: {self.watch.get(u, '')}" for u in m["users"])
             moved, wallets, err = await hedge_ticket(m["ch"], cat, reason[:900], interaction.user)
             (failed if err else done).append(f"<#{m['ch'].id}>" + (f" ({err})" if err else ""))
@@ -3066,27 +3152,42 @@ async def hedgescan(interaction: discord.Interaction, add: str = "", remove: str
         else:
             watch[key] = watch.get(key) or f"added by {interaction.user}"
         changed = True
+    removed = set()
     for u in re.split(r"[\s,]+", remove.strip()):
         u = u.lstrip("@").lower() if u and "@" not in u[1:] else (u or "").lower()
-        if u and (watch.pop(u, None) is not None or keys.pop(u, None) is not None):
+        if u:
+            watch.pop(u, None)
+            keys.pop(u, None)
+            removed.add(u)
             changed = True
     if changed:
-        save_hedge_watchlist(watch, keys)
-    matches = await hedge_matches(interaction.guild, watch, keys)
-    head = (f"**Hedging watchlist:** {len(watch)} usernames · {len(keys)} emails/account IDs"
-            + (" (updated)" if changed else ""))
+        save_hedge_watchlist(watch, keys, removed)
+    review = load_hedge_review(watch)
+    matches = await hedge_matches(interaction.guild, watch, keys, review)
+    head = (f"**Hedging watchlist:** {len(watch)} usernames · {len(keys)} emails/account IDs · "
+            f"{len(review)} review-only names" + (" (updated)" if changed else ""))
     if not matches:
         await interaction.followup.send(head + "\nNo open tickets match anyone on the list.", ephemeral=True)
         return
-    lines = [f"<#{m['ch'].id}> · **@{', @'.join(m['users'])}** · matched by {', '.join(m['how'])} · opened by {m['opener']}"
-             for m in matches]
-    embeds = _chunks(f"{len(matches)} open ticket(s) match the hedging watchlist", lines, 0xDC2626)
-    embeds[-1].set_footer(text="Check the matches, then press Hedge all to move them to the risk category quietly.")
-    await interaction.followup.send(head + "\nMatches on Cashed username (ticket name, payout form or linked account), "
-                                    "email, account ID, Cashed user ID or the opener's Discord name. A Discord-name-only "
-                                    "match can be a different person, so check those.",
-                                    embeds=embeds[:10], view=HedgeScanView(interaction.user.id, matches, watch),
-                                    ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+
+    def line(m):
+        why = "; ".join(filter(None, (watch.get(u) or review.get(u) or "" for u in m["users"])))[:140]
+        return (f"<#{m['ch'].id}> · **@{', @'.join(m['users'])}** · {', '.join(m['how'])} · opened by {m['opener']}"
+                + (f"\n↳ {why}" if why else ""))
+
+    groups = [("hedge", "Hedgers, exact match (Hedge all moves these)", 0xDC2626),
+              ("check", "Close name match on a hedger: check it's them, then /hedge", 0xF59E0B),
+              ("review", "Shared-IP link only: review manually (not moved)", 0x6B7280)]
+    embeds = []
+    for tier, title, colour in groups:
+        ls = [line(m) for m in matches if m["tier"] == tier]
+        if ls:
+            embeds += _chunks(f"{title} · {len(ls)}", ls, colour)
+    n = {t: sum(1 for m in matches if m["tier"] == t) for t, _, _ in groups}
+    kw = {"view": HedgeScanView(interaction.user.id, matches, watch)} if n["hedge"] else {}
+    await interaction.followup.send(head + f"\n**{n['hedge']}** to hedge · **{n['check']}** close matches to check · "
+                                    f"**{n['review']}** review only.", embeds=embeds[:10], ephemeral=True,
+                                    allowed_mentions=discord.AllowedMentions.none(), **kw)
 
 
 @bot.tree.command(name="panel", description="Post the 'Open payout ticket' panel in this channel")
