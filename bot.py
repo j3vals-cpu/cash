@@ -3247,15 +3247,19 @@ async def _ticket_people(guild: discord.Guild) -> list[dict]:
     return out
 
 
-@bot.tree.command(name="hedgelist", description="Find the real Discord @ of everyone on the hedging list from their tickets")
-@app_commands.describe(include_review="Also look up the shared-IP review-only names")
-async def hedgelist(interaction: discord.Interaction, include_review: bool = False):
+@bot.tree.command(name="hedgelist", description="Find the real Discord @ of everyone named in the risk files, from their tickets")
+@app_commands.describe(only_hedgers="Only the hedgers (default: everyone in the files)")
+async def hedgelist(interaction: discord.Interaction, only_hedgers: bool = False):
     if STAFF_ROLE_IDS and not is_staff(interaction.user):
         await interaction.response.send_message("This command is for staff only.", ephemeral=True)
         return
     await interaction.response.defer(ephemeral=True, thinking=True)
     watch, _ = load_hedge_watchlist()
-    review = load_hedge_review(watch) if include_review else {}
+    review = {} if only_hedgers else load_hedge_review(watch)
+    if not only_hedgers:  # also everyone else named in the files (combo tickets etc.)
+        for k, v in HEDGE_NOV7.get("other", {}).items():
+            if k not in watch:
+                review.setdefault(k, v)
     people = await _ticket_people(interaction.guild)
     exact = {}   # cashed name -> {discord id: (how, ticket)}
     close = {}
@@ -3273,15 +3277,17 @@ async def hedgelist(interaction: discord.Interaction, include_review: bool = Fal
         rows = [(n, i, how, ch) for n in sorted(names) for i, (how, ch) in src.get(n, {}).items()]
         if not rows:
             return None, None
-        shown = "\n".join(f"`{n}` → <@{i}> · {how} · <#{ch.id}>" for n, i, how, ch in rows)
+        shown = "\n".join(f"`{n}` → <@{i}> · {how} · <#{ch.id}>"
+                           + (f"\n  ↳ {(watch.get(n) or review.get(n) or '')[:90]}" if (watch.get(n) or review.get(n)) else "")
+                           for n, i, how, ch in rows)
         paste = "\n".join(f"{n} - <@{i}>" for n, i, _, _ in rows)
         return f"**{title}** ({len({r[0] for r in rows})})\n{shown}", paste
 
     sections = [("Hedgers · exact", exact, [n for n in watch if n in exact]),
                 ("Hedgers · close match, check it's them", close, [n for n in watch if n in close])]
-    if include_review:
-        sections += [("Review only (shared IP) · exact", exact, [n for n in review if n in exact]),
-                     ("Review only (shared IP) · close match", close, [n for n in review if n in close])]
+    if review:
+        sections += [("Others in the files (shared IP / combos) · exact", exact, [n for n in review if n in exact]),
+                     ("Others in the files · close match", close, [n for n in review if n in close])]
     found = set(exact) | set(close)
     missing = sorted(n for n in list(watch) + list(review) if n not in found)
     msgs = []
