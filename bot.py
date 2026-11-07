@@ -3203,6 +3203,117 @@ async def hedgescan(interaction: discord.Interaction, add: str = "", remove: str
                                             allowed_mentions=discord.AllowedMentions.none())
 
 
+async def _ticket_people(guild: discord.Guild) -> list[dict]:
+    """Every ticket channel (any category, incl. risk): who opened it and which Cashed names it mentions."""
+    sem = asyncio.Semaphore(5)
+    out = []
+
+    async def one(ch):
+        uid = re.search(r"uid:(\d+)", ch.topic or "")
+        opener, cashed = None, set()
+        async with sem:
+            try:
+                async for m in ch.history(limit=30, oldest_first=True):
+                    if opener is None and not m.author.bot:
+                        opener = m.author
+                    text = m.content or ""
+                    for e in m.embeds:
+                        text += " " + (e.description or "") + " " + " ".join(f"{f.name} {f.value}" for f in e.fields)
+                    for u in re.findall(r"(?i)\b(?:user(?:name)?|account)\b[\s*:_\-]{1,8}@?([A-Za-z0-9_.]{2,40})", text):
+                        cashed.add(("payout form", u.lower()))
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+        uid_ = int(uid.group(1)) if uid else (opener.id if opener else None)
+        if uid_ is None:
+            return
+        user = opener if opener is not None and opener.id == uid_ else None
+        if user is None:
+            try:
+                user = guild.get_member(uid_) or await guild.fetch_member(uid_)
+            except discord.HTTPException:
+                user = None
+        info = await cashed_lookup(uid_)
+        if info and info.get("linked") and info.get("username"):
+            cashed.add(("linked account", info["username"].lower()))
+        cashed.add(("ticket name", re.sub(r"^(?:payout|bug|pg)[-_]+", "", base_name(ch.name).lower())))
+        for a in ("name", "global_name", "display_name", "nick"):
+            v = getattr(user, a, None) if user else None
+            if v:
+                cashed.add(("Discord name", v.lower()))
+        out.append({"id": uid_, "ch": ch, "names": cashed,
+                    "discord": getattr(user, "name", None) or str(uid_)})
+
+    await asyncio.gather(*(one(c) for c in guild.text_channels if is_ticket_channel(c)))
+    return out
+
+
+@bot.tree.command(name="hedgelist", description="Find the real Discord @ of everyone on the hedging list from their tickets")
+@app_commands.describe(include_review="Also look up the shared-IP review-only names")
+async def hedgelist(interaction: discord.Interaction, include_review: bool = False):
+    if STAFF_ROLE_IDS and not is_staff(interaction.user):
+        await interaction.response.send_message("This command is for staff only.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    watch, _ = load_hedge_watchlist()
+    review = load_hedge_review(watch) if include_review else {}
+    people = await _ticket_people(interaction.guild)
+    exact = {}   # cashed name -> {discord id: (how, ticket)}
+    close = {}
+    for p in people:
+        for where, t in p["names"]:
+            for n in list(watch) + list(review):
+                if t == n or n in _name_tokens(t):
+                    exact.setdefault(n, {}).setdefault(p["id"], (where, p["ch"]))
+                elif _norm(t) not in _GENERIC and _close(t, n):
+                    close.setdefault(n, {}).setdefault(p["id"], (f"{where}: {t}", p["ch"]))
+    for n in exact:  # an exact hit beats a close one for the same name
+        close.pop(n, None)
+
+    def block(title, src, names):
+        rows = [(n, i, how, ch) for n in sorted(names) for i, (how, ch) in src.get(n, {}).items()]
+        if not rows:
+            return None, None
+        shown = "\n".join(f"`{n}` → <@{i}> · {how} · <#{ch.id}>" for n, i, how, ch in rows)
+        paste = "\n".join(f"{n} - <@{i}>" for n, i, _, _ in rows)
+        return f"**{title}** ({len({r[0] for r in rows})})\n{shown}", paste
+
+    sections = [("Hedgers · exact", exact, [n for n in watch if n in exact]),
+                ("Hedgers · close match, check it's them", close, [n for n in watch if n in close])]
+    if include_review:
+        sections += [("Review only (shared IP) · exact", exact, [n for n in review if n in exact]),
+                     ("Review only (shared IP) · close match", close, [n for n in review if n in close])]
+    found = set(exact) | set(close)
+    missing = sorted(n for n in list(watch) + list(review) if n not in found)
+    msgs = []
+    paste_all = []
+    for title, src, names in sections:
+        shown, paste = block(title, src, names)
+        if shown:
+            msgs.append(shown)
+            paste_all.append(paste)
+    head = (f"Scanned **{len(people)}** tickets. Found **{len(found)}** of {len(watch) + len(review)} names. "
+            f"Close matches are guesses: check them before posting.")
+    await interaction.followup.send(head, ephemeral=True)
+    for txt in msgs:
+        for i in range(0, len(txt), 1900):
+            await interaction.followup.send(txt[i:i + 1900], ephemeral=True,
+                                            allowed_mentions=discord.AllowedMentions.none())
+    if paste_all:
+        lines = "\n".join(paste_all).splitlines()
+        buf = []
+        for ln in lines + [None]:
+            if ln is None or sum(len(x) + 1 for x in buf) + len(ln) > 1800:
+                if buf:
+                    await interaction.followup.send("Copy and paste to post with their @'s:\n```\n" + "\n".join(buf) + "\n```",
+                                                    ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+                buf = []
+            if ln is not None:
+                buf.append(ln)
+    if missing:
+        txt = f"**No ticket found ({len(missing)}):** " + ", ".join(missing)
+        await interaction.followup.send(txt[:1990], ephemeral=True)
+
+
 @bot.tree.command(name="panel", description="Post the 'Open payout ticket' panel in this channel")
 @app_commands.describe(category="Optional: only needed if the payout ticket category isn't set")
 async def panel(interaction: discord.Interaction, category: discord.CategoryChannel = None):
