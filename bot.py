@@ -3087,7 +3087,8 @@ async def hedge_matches(guild: discord.Guild, watch: dict, keys: dict, review: d
         else:
             tier = "review"
         found.append({"ch": ch, "users": users, "how": sorted({w for w, _, _ in hits}), "tier": tier,
-                      "opener": member.mention if member is not None else "?"})
+                      "opener": member.mention if member is not None else "?",
+                      "opener_id": member.id if member is not None else None})
 
     chans = [c for c in guild.text_channels if is_ticket_channel(c) and c.category_id != HEDGE_CATEGORY_ID]
     await asyncio.gather(*(check(c) for c in chans))
@@ -3188,6 +3189,18 @@ async def hedgescan(interaction: discord.Interaction, add: str = "", remove: str
     await interaction.followup.send(head + f"\n**{n['hedge']}** to hedge · **{n['check']}** close matches to check · "
                                     f"**{n['review']}** review only.", embeds=embeds[:10], ephemeral=True,
                                     allowed_mentions=discord.AllowedMentions.none(), **kw)
+    # Copy-paste lists: raw <@id> tags work when pasted into a message (they tag the person)
+    parts = []
+    for tier, title, _ in groups:
+        ids = list(dict.fromkeys(m["opener_id"] for m in matches if m["tier"] == tier and m.get("opener_id")))
+        if ids:
+            parts.append(f"**{title.split(' (')[0].split(':')[0]}** ({len(ids)}):\n```\n"
+                         + " ".join(f"<@{i}>" for i in ids) + "\n```")
+    if parts:
+        txt = "**Copy and paste to tag them:**\n" + "\n".join(parts)
+        for i in range(0, len(txt), 1900):
+            await interaction.followup.send(txt[i:i + 1900], ephemeral=True,
+                                            allowed_mentions=discord.AllowedMentions.none())
 
 
 @bot.tree.command(name="panel", description="Post the 'Open payout ticket' panel in this channel")
