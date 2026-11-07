@@ -2938,13 +2938,12 @@ def _hedge_file() -> dict:
 
 def load_hedge_watchlist() -> tuple[dict, dict]:
     """(names: username -> why, keys: email / account ID / Cashed user ID -> username)"""
-    names = dict(HEDGE_WATCHLIST_DEFAULT)
-    for k, v in HEDGE_NOV7.get("hedge", {}).items():
-        names.setdefault(k, v)
-    keys = dict(HEDGE_KEYS_DEFAULT)
+    # Only the 7 Nov 2026 review (the older report is no longer used), plus anyone staff added by hand
+    names = dict(HEDGE_NOV7.get("hedge", {}))
+    keys = {}
     d = _hedge_file()
-    names.update({k.lower(): v for k, v in d.get("names", {}).items()})
-    keys.update({k.lower(): v for k, v in d.get("keys", {}).items()})
+    names.update({k.lower(): v for k, v in d.get("names", {}).items() if str(v).startswith("added by")})
+    keys.update({k.lower(): v for k, v in d.get("keys", {}).items() if k.lower() not in HEDGE_KEYS_DEFAULT})
     for k in d.get("removed", []):
         names.pop(k, None)
         keys.pop(k, None)
@@ -2959,7 +2958,7 @@ def load_hedge_review(watch: dict) -> dict:
 
 def save_hedge_watchlist(names: dict, keys: dict, removed: set | None = None):
     os.makedirs(DATA_DIR, exist_ok=True)
-    extra = {k: v for k, v in keys.items() if HEDGE_KEYS_DEFAULT.get(k) != v}
+    extra = dict(keys)
     gone = (set(_hedge_file().get("removed", [])) | set(removed or ())) - set(names) - set(keys)
     with open(HEDGE_WATCH_FILE, "w", encoding="utf-8") as f:
         json.dump({"names": names, "keys": extra, "removed": sorted(gone)}, f)
@@ -3247,7 +3246,7 @@ async def _ticket_people(guild: discord.Guild) -> list[dict]:
     return out
 
 
-@bot.tree.command(name="hedgelist", description="Find the real Discord @ of everyone named in the risk files, from their tickets")
+@bot.tree.command(name="hedgelist", description="Find the real Discord @ of everyone in the 7 Nov trading review, from their tickets")
 @app_commands.describe(only_hedgers="Only the hedgers (default: everyone in the files)")
 async def hedgelist(interaction: discord.Interaction, only_hedgers: bool = False):
     if STAFF_ROLE_IDS and not is_staff(interaction.user):
@@ -3256,10 +3255,6 @@ async def hedgelist(interaction: discord.Interaction, only_hedgers: bool = False
     await interaction.response.defer(ephemeral=True, thinking=True)
     watch, _ = load_hedge_watchlist()
     review = {} if only_hedgers else load_hedge_review(watch)
-    if not only_hedgers:  # also everyone else named in the files (combo tickets etc.)
-        for k, v in HEDGE_NOV7.get("other", {}).items():
-            if k not in watch:
-                review.setdefault(k, v)
     people = await _ticket_people(interaction.guild)
     exact = {}   # cashed name -> {discord id: (how, ticket)}
     close = {}
@@ -3286,7 +3281,7 @@ async def hedgelist(interaction: discord.Interaction, only_hedgers: bool = False
     sections = [("Hedgers · exact", exact, [n for n in watch if n in exact]),
                 ("Hedgers · close match, check it's them", close, [n for n in watch if n in close])]
     if review:
-        sections += [("Others in the files (shared IP / combos) · exact", exact, [n for n in review if n in exact]),
+        sections += [("Others in the report (shared IP) · exact", exact, [n for n in review if n in exact]),
                      ("Others in the files · close match", close, [n for n in review if n in close])]
     found = set(exact) | set(close)
     missing = sorted(n for n in list(watch) + list(review) if n not in found)
