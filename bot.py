@@ -3282,7 +3282,7 @@ async def hedgelist(interaction: discord.Interaction, only_hedgers: bool = False
                 ("Hedgers · close match, check it's them", close, [n for n in watch if n in close])]
     if review:
         sections += [("Others in the report (shared IP) · exact", exact, [n for n in review if n in exact]),
-                     ("Others in the files · close match", close, [n for n in review if n in close])]
+                     ("Others in the report · close match", close, [n for n in review if n in close])]
     found = set(exact) | set(close)
     missing = sorted(n for n in list(watch) + list(review) if n not in found)
     msgs = []
