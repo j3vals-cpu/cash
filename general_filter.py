@@ -16,9 +16,9 @@ log = logging.getLogger("ticket-bot")
 RULE_NAME = "Cashed Bot: payout complaints in general"
 DEFAULT_TICKET_CHANNEL = 1565738108698492978
 
-# Spelling tricks are caught too: "pay out", "pay-out", "pay0ut", "p@yout", "pend1ng", "w8ing" etc.
+# Spelling tricks are caught too: "pay out", "pay-out", "pay0ut", "p@yout", "payyoutz", "pend1ng", "w8ing" etc.
 # Payout words: payout, payment, withdrawal, money, funds, cash out, profits, earnings, payday
-_PAY = r"p[a@4]y[ -]?[o0]u[tr]s?|p[a@4]ym[e3]nts?|w[i1]thdr[a@4]w[a-z]*|m[o0]n[e3]y|funds|cash ?outs?|profits?|earnings|payday"
+_PAY = r"p[a@4]+y+[ -]?[o0]+u+[tr][sz]?|p[a@4]ym[e3]nt[sz]?|w[i1]thdr[a@4]w[a-z]*|m[o0]n[e3]y|funds|cash ?outs?|profits?|earnings"
 _W = r"(?:" + _PAY + r")"
 _PEND = r"p[e3]nd[i1]n[g']?"
 _WAIT = r"(?:w[a@4][i1]t[i1]n[g']?|w8[i1]n[g']?)"
@@ -33,9 +33,9 @@ PATTERNS = [
     # "payout ... not paid / not received / never came"
     r"(?i)\b" + _W + r"\b[ -~]{0,40}\b(?:not (?:been )?(?:paid|received|sent|processed|arrived)|never (?:came|arrived|received|paid))\b",
     # "when will my payout come", "where's payouts", "when do i get my money"
-    r"(?i)\b(?:when|where)(?:'s|s)?(?: (?:is|are|r|will|do|am)(?: i| we)?(?: get| getting| receive)?)? +(?:(?:my|the|our) +(?:[a-z0-9]+ +)?)?" + _W + r"\b",
+    r"(?i)\b(?:when|where)'?s?(?: (?:is|are|r|will|do|am)(?: i| we)?(?: get| getting| receive)?)? +(?:(?:my|the|our) +(?:[a-z0-9]+ +)?)?" + _W + r"\b",
     # "no response on my payout ticket", "payout where", "payout when??"
-    r"(?i)\bno (?:reply|response|answer|update|one)\b[ -~]{0,30}\b(?:" + _PAY + r"|ticket)\b|\bp[a@4]y[ -]?[o0]u[tr]s? +(?:where|wen|when)\b",
+    r"(?i)\bno(?:body| (?:reply|response|answer|update|one))\b[ -~]{0,30}\b(?:" + _PAY + r"|ticket)\b|\bp[a@4]+y+[ -]?[o0]+u+[tr][sz]? +(?:where|wen|when)\b",
     # "waiting ... for my payout", "pending payout", "still waiting to get paid"
     r"(?i)\b(?:" + _WAIT + r"|" + _PEND + r")\b[ -~]{0,40}\b(?:" + _PAY + r"|get paid|be paid)\b",
     # "haven't received my payout", "still not paid"
@@ -44,8 +44,8 @@ PATTERNS = [
     r"(?i)\b" + _N + r"\b[ -~]{0,30}\b(?:" + _PEND + r"|" + _WAIT + r"|still|no re(?:ply|sponse)|nothing|no p[a@4]y[a-z0 ]*)\b|\b(?:hasn'?t|haven'?t|not) +(?:yet +)?been paid\b",
     # "pending for 6 hours", "when am i getting paid", "why haven't i been paid"
     r"(?i)\b(?:" + _PEND + r"|" + _WAIT + r") +(?:for +)?(?:over +|more than +)?" + _N + r"\b|\b(?:when|why)\b[ -~]{0,20}\b(?:get|getting|be|being|been|not) paid\b",
-    # FUD: "cashed is a scam", "they won't pay"
-    r"(?i)\b(?:cashed|they|firm|you guys|this)\b[ -~]{0,30}\b(?:sc[a@4]m[a-z]*|rug[a-z]*|fraud[a-z]*|won'?t pay|wont pay|don'?t pay|doesn'?t pay|never pays?|not paying|refus[a-z]* to pay|steal[a-z]*)\b",
+    # FUD: "cashed is a scam", "they won't pay" · ignored tickets: "my ticket has not been attended to"
+    r"(?i)\b(?:cashed|they|firm|you guys|this)\b[ -~]{0,30}\b(?:(?:sc[a@4]m|rug|fraud|steal)[a-z]*|(?:won'?t|don'?t|doesn'?t|never|not|refus[a-z]* to) pay)|\btickets?\b[ -~]{0,25}(?:not|n'?t|never|nobody|still)\b[ -~]{0,12}(?:attend|answer|respond|repl|seen)",
 ]
 _COMPILED = [re.compile(p) for p in PATTERNS]
 

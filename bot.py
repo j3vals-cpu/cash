@@ -311,6 +311,7 @@ class TicketBot(discord.Client):
         self.loop.create_task(tag_rule_on_start())
         self.loop.create_task(fud_rule_on_start())
         self.loop.create_task(jail_loop())
+        self.loop.create_task(idle_close_loop())  # close tickets where the trader stopped replying to staff
         self.loop.create_task(ultra_voice.ensure())  # download Ultra's voice in the background
         # Public API for the website's live payout feed (needs Railway public networking)
         import web_api
@@ -2398,6 +2399,14 @@ def open_ticket_of(guild, user_id, kind: str = "Payout ticket"):
                 None)
 
 
+def any_open_ticket(guild, user_id):
+    """Any ticket this person already has open (payout or payout bug). One ticket per person at a time."""
+    return next((c for c in guild.text_channels if our_ticket(c) and f"uid:{user_id}" in (c.topic or "")), None)
+
+
+ONE_TICKET_MSG = "You already have an open ticket: {mention}\nYou can only have one ticket open at a time, so please use that one."
+
+
 def slug(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", (text or "").lower()).strip("-")[:60]
 
@@ -2474,10 +2483,9 @@ class PayoutForm(discord.ui.Modal, title="Payout request"):
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True, thinking=True)
         guild, user = interaction.guild, interaction.user
-        existing = open_ticket_of(guild, user.id)
+        existing = any_open_ticket(guild, user.id)
         if existing:
-            await interaction.followup.send(f"You already have an open payout ticket: {existing.mention}",
-                                            ephemeral=True)
+            await interaction.followup.send(ONE_TICKET_MSG.format(mention=existing.mention), ephemeral=True)
             return
         cat = guild.get_channel(self.category_id)
         if not isinstance(cat, discord.CategoryChannel):
@@ -2561,10 +2569,9 @@ class PayoutBugForm(discord.ui.Modal, title="Report a payout bug"):
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True, thinking=True)
         guild, user = interaction.guild, interaction.user
-        existing = open_ticket_of(guild, user.id, "Payout bug")
+        existing = any_open_ticket(guild, user.id)
         if existing:
-            await interaction.followup.send(f"You already have an open payout bug ticket: {existing.mention}",
-                                            ephemeral=True)
+            await interaction.followup.send(ONE_TICKET_MSG.format(mention=existing.mention), ephemeral=True)
             return
         cat = guild.get_channel(self.category_id)
         if not isinstance(cat, discord.CategoryChannel):
@@ -2627,10 +2634,9 @@ class PayoutBugButton(discord.ui.DynamicItem[discord.ui.Button], template=r"cash
     async def callback(self, interaction: discord.Interaction):
         if interaction.guild is None:
             return
-        existing = open_ticket_of(interaction.guild, interaction.user.id, "Payout bug")
+        existing = any_open_ticket(interaction.guild, interaction.user.id)
         if existing:
-            await interaction.response.send_message(f"You already have an open payout bug ticket: {existing.mention}",
-                                                    ephemeral=True)
+            await interaction.response.send_message(ONE_TICKET_MSG.format(mention=existing.mention), ephemeral=True)
             return
         info = await cashed_lookup(interaction.user.id)
         await interaction.response.send_modal(PayoutBugForm(PAYOUT_BUG_CATEGORY_ID or self.category_id,
@@ -2652,10 +2658,9 @@ class OpenTicketButton(discord.ui.DynamicItem[discord.ui.Button], template=r"cas
     async def callback(self, interaction: discord.Interaction):
         if interaction.guild is None:
             return
-        existing = open_ticket_of(interaction.guild, interaction.user.id)
+        existing = any_open_ticket(interaction.guild, interaction.user.id)
         if existing:
-            await interaction.response.send_message(f"You already have an open payout ticket: {existing.mention}",
-                                                    ephemeral=True)
+            await interaction.response.send_message(ONE_TICKET_MSG.format(mention=existing.mention), ephemeral=True)
             return
         # quick look-up so the form can pre-fill their verified username + email (must answer within 3s)
         info = await cashed_lookup(interaction.user.id)
@@ -2671,7 +2676,8 @@ class OpenTicketButton(discord.ui.DynamicItem[discord.ui.Button], template=r"cas
 
 # ---- closing our own tickets (staff only): transcript -> log channel, then delete the channel
 
-async def save_transcript(ch, closed_by) -> bool:
+async def save_transcript(ch, closed_by, reason: str | None = None) -> bool:
+    """Transcript goes to the staff transcript channel only. It is never sent to the trader."""
     if not TRANSCRIPT_CHANNEL_ID:
         return False
     import io
@@ -2687,8 +2693,10 @@ async def save_transcript(ch, closed_by) -> bool:
     e = discord.Embed(title=f"Ticket closed · #{ch.name}", colour=0x6B7280, timestamp=datetime.now(timezone.utc))
     if uid:
         e.add_field(name="Trader", value=f"<@{uid.group(1)}>", inline=True)
-    e.add_field(name="Closed by", value=closed_by.mention, inline=True)
+    e.add_field(name="Closed by", value=f"{closed_by.mention} ({closed_by})", inline=True)
     e.add_field(name="Opened", value=f"<t:{int(ch.created_at.timestamp())}:f>", inline=True)
+    if reason:
+        e.add_field(name="Reason", value=reason[:1024], inline=False)
     log_ch = bot.get_channel(TRANSCRIPT_CHANNEL_ID) or await bot.fetch_channel(TRANSCRIPT_CHANNEL_ID)
     await log_ch.send(embed=e, file=discord.File(io.BytesIO("\n".join(lines).encode()), filename=f"{ch.name}.txt"),
                       allowed_mentions=discord.AllowedMentions.none())
@@ -2712,6 +2720,7 @@ class CloseConfirm(discord.ui.View):
             await interaction.followup.send("Couldn't save the transcript, so the ticket was NOT closed.",
                                             ephemeral=True)
             return
+        _bot_closing.add(self.ch.id)
         try:
             await self.ch.delete(reason=f"Closed by {interaction.user}")
         except discord.NotFound:
@@ -2759,6 +2768,110 @@ def close_view() -> discord.ui.View:
 @bot.tree.command(name="close", description="Save the transcript and close this payout ticket")
 async def close_cmd(interaction: discord.Interaction):
     await ask_close(interaction, interaction.channel)
+
+
+# ---- auto-close: when staff replied last and the trader who opened the ticket hasn't answered in 48 hours.
+# Only the opener's silence counts: a trader who is still waiting on staff is never closed. Runs on every open ticket,
+# including ones opened before this was added. The transcript goes to the staff transcript channel only.
+
+IDLE_CLOSE_HOURS = float(os.getenv("IDLE_CLOSE_HOURS", "48"))
+IDLE_WARN_HOURS = float(os.getenv("IDLE_WARN_HOURS", "24"))
+IDLE_WARN_MARK = "-# auto-close notice"
+_bot_closing: set[int] = set()  # tickets the bot itself is deleting (so the delete log doesn't double up)
+
+
+async def _idle_check(ch: discord.TextChannel, now: datetime):
+    uid = re.search(r"uid:(\d+)", ch.topic or "")
+    if not uid:
+        return
+    opener = int(uid.group(1))
+    last_human, warned_after = None, False
+    async for m in ch.history(limit=50):
+        if m.author.bot:
+            if m.author.id == bot.user.id and IDLE_WARN_MARK in (m.content or "") and last_human is None:
+                warned_after = True
+            continue
+        last_human = m
+        break
+    if last_human is None or last_human.author.id == opener:
+        return  # trader spoke last (or nobody but the bot has): they're waiting on staff, leave it open
+    silent = (now - last_human.created_at).total_seconds() / 3600
+    if silent >= IDLE_CLOSE_HOURS:
+        why = (f"Auto-closed: the trader didn't reply for {IDLE_CLOSE_HOURS:g} hours after staff "
+               f"({last_human.author}) last replied on {last_human.created_at:%d %b %H:%M} UTC.")
+        try:
+            saved = await save_transcript(ch, ch.guild.me, why)
+        except Exception:
+            log.exception("Auto-close: transcript failed for #%s, leaving it open", ch.name)
+            return
+        if not saved:
+            log.warning("Auto-close skipped for #%s: no transcript channel set", ch.name)
+            return
+        _bot_closing.add(ch.id)
+        try:
+            await ch.delete(reason=f"Auto-closed by Cashed Bot: no reply from the trader in {IDLE_CLOSE_HOURS:g}h")
+        except discord.NotFound:
+            pass
+        member = ch.guild.get_member(opener)
+        if member:
+            try:
+                await member.send(f"Your ticket **#{ch.name}** in {ch.guild.name} was closed because we didn't hear "
+                                  f"back from you for {IDLE_CLOSE_HOURS:g} hours. If you still need help, "
+                                  f"just open a new ticket.")
+            except discord.HTTPException:
+                pass
+    elif silent >= IDLE_WARN_HOURS and not warned_after:
+        left = int(IDLE_CLOSE_HOURS - silent + 0.5)
+        await ch.send(f"<@{opener}> we're waiting on your reply. If we don't hear from you in about {left} hours, "
+                      f"this ticket will close automatically.\n{IDLE_WARN_MARK}",
+                      allowed_mentions=discord.AllowedMentions(users=[discord.Object(opener)]))
+
+
+async def idle_close_loop():
+    await bot.wait_until_ready()
+    await asyncio.sleep(120)
+    while True:
+        now = datetime.now(timezone.utc)
+        for g in bot.guilds:
+            for ch in [c for c in g.text_channels if our_ticket(c)]:
+                try:
+                    await _idle_check(ch, now)
+                except discord.HTTPException:
+                    log.warning("Auto-close check failed for #%s", ch.name, exc_info=True)
+                except Exception:
+                    log.exception("Auto-close check crashed for #%s", ch.name)
+                await asyncio.sleep(1)
+        await asyncio.sleep(15 * 60)
+
+
+async def log_ticket_deleted(channel):
+    """Someone deleted a ticket channel by hand (not through Close ticket): say who, in the transcript channel."""
+    if not our_ticket(channel) or channel.id in _bot_closing:
+        _bot_closing.discard(channel.id)
+        return
+    who = None
+    try:
+        await asyncio.sleep(2)
+        async for entry in channel.guild.audit_logs(limit=10, action=discord.AuditLogAction.channel_delete):
+            if entry.target and entry.target.id == channel.id:
+                who = entry.user
+                break
+    except discord.HTTPException:
+        log.warning("Couldn't read the audit log (needs View Audit Log) for deleted ticket #%s", channel.name)
+    if not TRANSCRIPT_CHANNEL_ID:
+        return
+    uid = re.search(r"uid:(\d+)", channel.topic or "")
+    e = discord.Embed(title=f"Ticket deleted · #{channel.name}", colour=0xB42318, timestamp=datetime.now(timezone.utc),
+                      description="Deleted directly, not with Close ticket, so no transcript was saved.")
+    if uid:
+        e.add_field(name="Trader", value=f"<@{uid.group(1)}>", inline=True)
+    e.add_field(name="Deleted by", value=f"{who.mention} ({who})" if who else "Unknown (check the audit log)", inline=True)
+    e.add_field(name="Opened", value=f"<t:{int(channel.created_at.timestamp())}:f>", inline=True)
+    try:
+        log_ch = bot.get_channel(TRANSCRIPT_CHANNEL_ID) or await bot.fetch_channel(TRANSCRIPT_CHANNEL_ID)
+        await log_ch.send(embed=e, allowed_mentions=discord.AllowedMentions.none())
+    except discord.HTTPException:
+        log.warning("Couldn't log deleted ticket #%s", channel.name)
 
 
 # --------------------------------------------------------------------------- #
@@ -3925,6 +4038,7 @@ async def on_guild_channel_create(channel):
 @bot.event
 async def on_guild_channel_delete(channel):
     bot.loop.create_task(_fud_refresh(channel.guild))
+    bot.loop.create_task(log_ticket_deleted(channel))
 
 
 @bot.event
