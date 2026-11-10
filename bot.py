@@ -307,7 +307,6 @@ class TicketBot(discord.Client):
         self.loop.create_task(rebuild_risk_from_category())
         self.loop.create_task(mod_stats.save_loop())
         self.loop.create_task(chat_stats.save_loop())
-        self.loop.create_task(chat_backfill())  # rebuild this week's chat counts from history
         self.loop.create_task(briefing_loop())
         self.loop.create_task(extras.timer_loop())
         self.loop.create_task(tag_rule_on_start())
@@ -3678,6 +3677,8 @@ def chat_ticket(ch) -> bool:
     return our_ticket(ch) or (getattr(ch, "name", "") or "").startswith(("payout-", "bug-", "ticket-", "closed-"))
 
 
+# Only messages in these channels count on the community board (general chat)
+CHAT_CHANNEL_IDS = {int(x) for x in os.getenv("CHAT_CHANNEL_IDS", "1558443257879335042").split(",") if x.strip()}
 # Team roles that never count on the community board (plus the staff and mod roles)
 CHAT_EXCLUDE_ROLE_IDS = {int(x) for x in os.getenv(
     "CHAT_EXCLUDE_ROLE_IDS", "1351114715539050607,1565739044921675997,1351114465478836245").split(",") if x.strip()}
@@ -3702,37 +3703,6 @@ def chat_member(a) -> bool:
         return False
     name = f"{getattr(a, 'display_name', '')} {getattr(a, 'name', '')}".lower()
     return "| cashed" not in name and "|cashed" not in name
-
-
-async def chat_backfill():
-    """Count this week's messages from channel history, so the board is right even after a restart or deploy."""
-    await bot.wait_until_ready()
-    await asyncio.sleep(30)
-    week0 = uk_week_start(time.time())
-    after = datetime.fromtimestamp(week0, timezone.utc)
-    counts: dict[str, int] = {}
-    for g in bot.guilds:
-        for ch in g.text_channels:
-            if chat_ticket(ch) or not ch.permissions_for(g.me).read_message_history:
-                continue
-            last: dict[int, float] = {}
-            try:
-                async for m in ch.history(after=after, limit=20000, oldest_first=True):
-                    if not await is_chat_member(g, m.author):
-                        continue
-                    ts = m.created_at.timestamp()
-                    if ts - last.get(m.author.id, 0) < ChatStats.CHAT_COOLDOWN:
-                        continue
-                    last[m.author.id] = ts
-                    counts[str(m.author.id)] = counts.get(str(m.author.id), 0) + 1
-                    chat_stats.names[str(m.author.id)] = m.author.display_name
-            except discord.HTTPException:
-                continue
-    if counts:
-        chat_stats.weeks[str(int(week0))] = counts
-        chat_stats.dirty = True
-        chat_stats.save()
-    log.info("Chat leaderboard backfilled: %d members this week", len(counts))
 
 
 def is_mod(member) -> bool:
@@ -3831,8 +3801,10 @@ async def on_message(message: discord.Message):
         ticket_replies.note(message)
     if message.author.bot:
         return
-    if not chat_ticket(message.channel) and chat_member(message.author):
-        chat_stats.add(message)
+    if message.channel.id in CHAT_CHANNEL_IDS and chat_member(message.author):
+        cfg = _board_cfg()
+        if cfg.get("community_on") and message.created_at.timestamp() >= cfg.get("community_since", 0):
+            chat_stats.add(message)
     if is_mod(message.author):
         ts = message.created_at.timestamp()
         mod_stats.add(message.author, message.channel, ts, in_ticket)
@@ -3952,15 +3924,23 @@ def leaderboard_embed(start: float, end: float, title: str) -> discord.Embed:
 BOARD_FILE = os.path.join(DATA_DIR, "mod_board.json")
 
 
+_board_cache: dict = {"at": 0.0, "cfg": None}
+
+
 def _board_cfg() -> dict:
+    if _board_cache["cfg"] is not None and time.time() - _board_cache["at"] < 30:
+        return dict(_board_cache["cfg"])
     try:
         with open(BOARD_FILE, encoding="utf-8") as f:
-            return json.load(f)
+            cfg = json.load(f)
     except Exception:
-        return {}
+        cfg = {}
+    _board_cache.update(at=time.time(), cfg=cfg)
+    return dict(cfg)
 
 
 def _board_save(cfg: dict):
+    _board_cache.update(at=time.time(), cfg=dict(cfg))
     try:
         os.makedirs(DATA_DIR, exist_ok=True)
         with open(BOARD_FILE, "w", encoding="utf-8") as f:
@@ -4044,14 +4024,31 @@ async def community_top3(guild, week0: float) -> list[tuple[str, int]]:
     return out
 
 
+async def _chat_name(guild, uid: str) -> str:
+    """Their name as text, so it shows even when Discord can't render the @ (person not loaded on your app)."""
+    m = guild.get_member(int(uid)) if guild else None
+    if m is None and guild is not None:
+        try:
+            m = await guild.fetch_member(int(uid))
+        except discord.HTTPException:
+            m = None
+    name = m.display_name if m else chat_stats.names.get(uid, "member")
+    return discord.utils.escape_markdown(name)
+
+
 async def community_embed(week0: float, end: float, title: str, guild=None) -> discord.Embed:
     top = await community_top3(guild, week0)
-    lines = [f"{MEDALS[i]} <@{uid}> · **{n:,}** messages" for i, (uid, n) in enumerate(top)]
+    lines = [f"{MEDALS[i]} **{await _chat_name(guild, uid)}** (<@{uid}>) · **{n:,}** messages"
+             for i, (uid, n) in enumerate(top)]
+    since = max(week0, _board_cfg().get("community_since", 0))
+    where = " ".join(f"<#{c}>" for c in CHAT_CHANNEL_IDS)
     e = discord.Embed(title=title, colour=0x22C55E,
-                      description="\n".join(lines) or "No community messages yet this week.")
-    e.add_field(name="Period", value=f"<t:{int(week0)}:D> to <t:{int(end) - 1}:D>", inline=False)
-    e.set_footer(text=f"Members only: staff and bots aren't counted. Ticket messages don't count, and only one "
+                      description="\n".join(lines) or "No messages counted yet.")
+    e.add_field(name="Period", value=f"<t:{int(since)}:f> to <t:{int(end) - 1}:f>", inline=False)
+    e.set_footer(text=f"Counts messages in general only. Members only: staff and bots aren't counted, and only one "
                       f"message every {ChatStats.CHAT_COOLDOWN}s counts, so spamming won't help.")
+    if where:
+        e.description += f"\n\n-# Channel: {where}"
     return e
 
 
@@ -4075,6 +4072,29 @@ async def community_top(interaction: discord.Interaction, week: app_commands.Cho
     else:
         e = await community_embed(this_start, now + 1, "💬 Top chatters · this week so far", interaction.guild)
     await interaction.followup.send(embed=e, ephemeral=private, allowed_mentions=discord.AllowedMentions.none())
+
+
+@community_group.command(name="leaderboard", description="Start or stop counting general chat for the top 3")
+@app_commands.describe(enabled="On: start counting from now (resets this week's count). Off: stop counting.")
+async def community_leaderboard(interaction: discord.Interaction, enabled: bool):
+    if STAFF_ROLE_IDS and not is_staff(interaction.user):
+        await interaction.response.send_message("This command is for staff only.", ephemeral=True)
+        return
+    cfg = _board_cfg()
+    now = time.time()
+    if enabled:
+        cfg["community_on"], cfg["community_since"] = True, now
+        chat_stats.weeks.pop(str(int(uk_week_start(now))), None)  # start this week's count from zero
+        chat_stats.dirty = True
+        chat_stats.save()
+        where = " ".join(f"<#{c}>" for c in CHAT_CHANNEL_IDS)
+        msg = (f"Community leaderboard is on. Counting member messages in {where} from <t:{int(now)}:t> today. "
+               f"Staff and bots don't count. It resets every Monday.")
+    else:
+        cfg["community_on"] = False
+        msg = "Community leaderboard counting stopped."
+    _board_save(cfg)
+    await interaction.response.send_message(msg, ephemeral=True)
 
 
 @community_group.command(name="postchannel", description="Post last week's top 3 chatters here every Monday at 9am")
@@ -4114,7 +4134,7 @@ async def leaderboard_loop():
                               allowed_mentions=discord.AllowedMentions.none())
                 cfg["posted"] = week0
                 _board_save(cfg)
-            if cfg.get("community_channel") and now >= week0 + 9 * 3600 and cfg.get("community_posted", 0) < week0:
+            if cfg.get("community_channel") and cfg.get("community_on") and now >= week0 + 9 * 3600 and cfg.get("community_posted", 0) < week0:
                 ch = bot.get_channel(cfg["community_channel"]) or await bot.fetch_channel(cfg["community_channel"])
                 start = uk_week_start(week0 - 3600)
                 winners = [int(u) for u, _ in await community_top3(ch.guild, start)]
