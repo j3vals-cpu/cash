@@ -3083,6 +3083,14 @@ async def clean_empty_categories(guild: discord.Guild) -> list[str]:
             keep.add(ids[0])
     bases = [guild.get_channel(i) for i in (PAYOUT_TICKET_CATEGORY_ID, PAYOUT_BUG_CATEGORY_ID)]
     bases = [b for b in bases if isinstance(b, discord.CategoryChannel)]
+    # a status with two categories (e.g. two "Payout Support Verified 2"): keep a non-empty one as the main one
+    for ids in _triage.get("cats", {}).values():
+        cs = [guild.get_channel(i) for i in ids]
+        cs = [c for c in cs if isinstance(c, discord.CategoryChannel)]
+        cs.sort(key=lambda c: (len(c.channels) == 0, c.position))
+        ids[:] = [c.id for c in cs]
+    keep = {PAYOUT_TICKET_CATEGORY_ID, PAYOUT_BUG_CATEGORY_ID, HEDGE_CATEGORY_ID} | \
+        {ids[0] for ids in _triage.get("cats", {}).values() if ids}
     triage_extra = {i for ids in _triage.get("cats", {}).values() for i in ids[1:]}
     gone = []
     for cat in list(guild.categories):
@@ -3100,9 +3108,30 @@ async def clean_empty_categories(guild: discord.Guild) -> list[str]:
         except discord.HTTPException:
             log.warning("Couldn't delete empty category %s", cat.name, exc_info=True)
         await asyncio.sleep(1)
-    if gone:
-        _triage_save(_triage)
+    _triage_save(_triage)
+    await order_triage_categories(guild)
     return gone
+
+
+async def order_triage_categories(guild: discord.Guild):
+    """Keep the categories in order 1, 2, 3 (each followed by its overflow), using the slots they already have."""
+    order = []
+    for st in ("clean", "check", "flagged"):
+        for i in _triage.get("cats", {}).get(st, []):
+            c = guild.get_channel(i)
+            if isinstance(c, discord.CategoryChannel):
+                order.append(c)
+    if len(order) < 2:
+        return
+    current = sorted(order, key=lambda c: c.position)
+    if [c.id for c in current] == [c.id for c in order]:
+        return
+    slots = [c.position for c in current]
+    try:
+        await bot.http.bulk_channel_update(guild.id, [{"id": c.id, "position": p} for c, p in zip(order, slots)],
+                                           reason="Ticket categories in order 1, 2, 3")
+    except discord.HTTPException:
+        log.warning("Couldn't order ticket categories", exc_info=True)
 
 
 @bot.tree.command(name="cleancategories", description="Delete empty ticket overflow categories")
