@@ -2846,7 +2846,10 @@ async def _idle_check(ch: discord.TextChannel, now: datetime):
         last_human = m
         break
     if last_human is None or last_human.author.id == opener:
-        return  # trader spoke last (or nobody but the bot has): they're waiting on staff, leave it open
+        # trader spoke last (or nobody but the bot has): they're waiting on staff, leave it open
+        since = last_human.created_at if last_human else ch.created_at
+        key = last_human.id if last_human else ch.id
+        return ("waiting", (now - since).total_seconds() / 3600, key, opener)
     silent = (now - last_human.created_at).total_seconds() / 3600
     if silent >= IDLE_CLOSE_HOURS:
         why = (f"Auto-closed: the trader didn't reply for {IDLE_CLOSE_HOURS:g} hours after staff "
@@ -2879,20 +2882,96 @@ async def _idle_check(ch: discord.TextChannel, now: datetime):
                       allowed_mentions=discord.AllowedMentions(users=[discord.Object(opener)]))
 
 
+SLA_HOURS = float(os.getenv("SLA_HOURS", "24"))
+SLA_FILE = os.path.join(DATA_DIR, "sla.json")
+
+
+def _sla_cfg() -> dict:
+    try:
+        with open(SLA_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _sla_save(cfg: dict):
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        with open(SLA_FILE, "w", encoding="utf-8") as f:
+            json.dump(cfg, f)
+    except Exception:
+        log.exception("Couldn't save SLA settings")
+
+
+async def sla_alert(guild: discord.Guild, waiting: list):
+    """Tell staff about tickets where the trader has waited SLA_HOURS+ for a staff reply. Each waiting stretch
+    is only alerted once; it resets when staff reply."""
+    cfg = _sla_cfg()
+    gcfg = cfg.get(str(guild.id), {})
+    if not gcfg.get("channel"):
+        return
+    alerted = set(gcfg.get("alerted", []))
+    new = [(ch, h, key, opener) for ch, h, key, opener in waiting if h >= SLA_HOURS and str(key) not in alerted]
+    keep = {str(key) for _, _, key, _ in waiting}
+    gcfg["alerted"] = [k for k in alerted if k in keep]
+    if new:
+        new.sort(key=lambda x: -x[1])
+        lines = [f"• {ch.mention} · <@{opener}> waiting **{int(h)}h**" for ch, h, _, opener in new[:30]]
+        more = f"\n…and {len(new) - 30} more" if len(new) > 30 else ""
+        total = sum(1 for _, h, _, _ in waiting if h >= SLA_HOURS)
+        role = f"<@&{gcfg['role']}> " if gcfg.get("role") else ""
+        try:
+            ch = guild.get_channel(gcfg["channel"]) or await bot.fetch_channel(gcfg["channel"])
+            await ch.send(f"{role}⏰ **{len(new)} ticket{'s' if len(new) != 1 else ''} waiting {SLA_HOURS:g}h+ for a "
+                          f"staff reply** ({total} in total)\n" + "\n".join(lines) + more,
+                          allowed_mentions=discord.AllowedMentions(roles=True, users=False))
+            gcfg["alerted"] += [str(key) for _, _, key, _ in new]
+        except discord.HTTPException:
+            log.warning("Couldn't post ticket alert", exc_info=True)
+    cfg[str(guild.id)] = gcfg
+    _sla_save(cfg)
+
+
+@bot.tree.command(name="ticketalerts", description="Alert staff here when a trader has waited 24h+ for a reply")
+@app_commands.describe(enabled="On: post alerts in this channel. Off: stop.", role="Optional role to ping")
+async def ticketalerts(interaction: discord.Interaction, enabled: bool = True, role: discord.Role = None):
+    if not (interaction.user.guild_permissions.administrator or is_staff(interaction.user)):
+        await interaction.response.send_message("Staff only.", ephemeral=True)
+        return
+    cfg = _sla_cfg()
+    g = cfg.setdefault(str(interaction.guild_id), {})
+    if enabled:
+        g["channel"], g["role"] = interaction.channel_id, role.id if role else None
+        msg = (f"Ticket alerts on: tickets where the trader has waited {SLA_HOURS:g}h+ for a staff reply will be "
+               f"posted here{f' and ping {role.mention}' if role else ''}. Checked every 15 minutes.")
+    else:
+        g.pop("channel", None)
+        msg = "Ticket alerts off."
+    _sla_save(cfg)
+    await interaction.response.send_message(msg, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+
+
 async def idle_close_loop():
     await bot.wait_until_ready()
     await asyncio.sleep(120)
     while True:
         now = datetime.now(timezone.utc)
         for g in bot.guilds:
+            waiting = []
             for ch in [c for c in g.text_channels if our_ticket(c)]:
                 try:
-                    await _idle_check(ch, now)
+                    r = await _idle_check(ch, now)
+                    if r and r[0] == "waiting":
+                        waiting.append((ch, r[1], r[2], r[3]))
                 except discord.HTTPException:
                     log.warning("Auto-close check failed for #%s", ch.name, exc_info=True)
                 except Exception:
                     log.exception("Auto-close check crashed for #%s", ch.name)
                 await asyncio.sleep(1)
+            try:
+                await sla_alert(g, waiting)
+            except Exception:
+                log.exception("Ticket alert failed")
         await asyncio.sleep(15 * 60)
 
 
