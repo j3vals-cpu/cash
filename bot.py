@@ -3694,14 +3694,19 @@ CHAT_EXCLUDE_ROLE_WORDS = [w.strip().lower() for w in os.getenv(
     "CHAT_EXCLUDE_ROLE_WORDS", "mod,support,staff,admin,team,manager,owner,founder,dev,helper").split(",") if w.strip()]
 
 
+# Everyday roles that never make someone "team", even if one of their ids ends up in a staff list
+CHAT_MEMBER_ROLE_NAMES = {n.strip().lower() for n in os.getenv(
+    "CHAT_MEMBER_ROLE_NAMES", "member,members,trader,traders,verified,@everyone").split(",") if n.strip()}
+
+
 def chat_skip_reason(a) -> str | None:
     """Why someone doesn't count on the community board, or None if they do."""
     if getattr(a, "bot", False):
         return "bot"
-    roles = getattr(a, "roles", [])
+    roles = [r for r in getattr(a, "roles", []) if r.name.lower().strip() not in CHAT_MEMBER_ROLE_NAMES]
     for r in roles:
         if r.id in STAFF_ROLE_IDS or r.id in MOD_ROLE_IDS or r.id in CHAT_EXCLUDE_ROLE_IDS:
-            return f"team role {r.name}"
+            return f"team role {r.name} ({r.id})"
     for r in roles:
         for w in CHAT_EXCLUDE_ROLE_WORDS:
             if re.search(rf"\b{re.escape(w)}", r.name.lower()):
