@@ -3678,15 +3678,30 @@ def chat_ticket(ch) -> bool:
     return our_ticket(ch) or (getattr(ch, "name", "") or "").startswith(("payout-", "bug-", "ticket-", "closed-"))
 
 
+# Team roles that never count on the community board (plus the staff and mod roles)
+CHAT_EXCLUDE_ROLE_IDS = {int(x) for x in os.getenv(
+    "CHAT_EXCLUDE_ROLE_IDS", "1351114715539050607,1565739044921675997,1351114465478836245").split(",") if x.strip()}
+CHAT_EXCLUDE_ROLE_WORDS = [w.strip().lower() for w in os.getenv(
+    "CHAT_EXCLUDE_ROLE_WORDS", "mod,support,staff,admin,team,manager,owner,founder,dev,helper").split(",") if w.strip()]
+
+
 def chat_member(a) -> bool:
-    """A normal member for the chat leaderboard: not a bot, not an admin, no staff or mod role.
-    (Stricter than is_staff, which also counts any role ranked above the staff roles.)"""
+    """A normal member for the community leaderboard. Anyone on the team is left out: bots, staff/mod role ids,
+    any role whose name says mod / support / staff / admin / team etc. (e.g. 'Cashed MOD', 'Support Agent'),
+    anyone with moderator permissions, and anyone with '| Cashed' in their name."""
     if getattr(a, "bot", False):
         return False
-    perms = getattr(a, "guild_permissions", None)
-    if perms is not None and perms.administrator:
+    roles = getattr(a, "roles", [])
+    if any(r.id in STAFF_ROLE_IDS or r.id in MOD_ROLE_IDS or r.id in CHAT_EXCLUDE_ROLE_IDS for r in roles):
         return False
-    return not any(r.id in STAFF_ROLE_IDS or r.id in MOD_ROLE_IDS for r in getattr(a, "roles", []))
+    if any(w in r.name.lower() for r in roles for w in CHAT_EXCLUDE_ROLE_WORDS):
+        return False
+    p = getattr(a, "guild_permissions", None)
+    if p is not None and (p.administrator or p.manage_messages or p.moderate_members or p.kick_members
+                          or p.ban_members or p.manage_roles or p.manage_channels):
+        return False
+    name = f"{getattr(a, 'display_name', '')} {getattr(a, 'name', '')}".lower()
+    return "| cashed" not in name and "|cashed" not in name
 
 
 async def chat_backfill():
@@ -3703,7 +3718,7 @@ async def chat_backfill():
             last: dict[int, float] = {}
             try:
                 async for m in ch.history(after=after, limit=20000, oldest_first=True):
-                    if not chat_member(m.author):
+                    if not await is_chat_member(g, m.author):
                         continue
                     ts = m.created_at.timestamp()
                     if ts - last.get(m.author.id, 0) < ChatStats.CHAT_COOLDOWN:
@@ -3990,8 +4005,47 @@ async def mod_leaderboard_channel(interaction: discord.Interaction, enabled: boo
     await interaction.response.send_message(msg, ephemeral=True)
 
 
-def community_embed(week0: float, end: float, title: str) -> discord.Embed:
-    top = chat_stats.top(week0, 3)
+_chat_member_cache: dict[int, tuple[bool, float]] = {}
+
+
+async def is_chat_member(guild, user) -> bool:
+    """chat_member with the person's real roles. Message history and the cache often only give a plain user
+    with no roles, so look the member up (and remember the answer for an hour)."""
+    uid = user.id if hasattr(user, "id") else int(user)
+    hit = _chat_member_cache.get(uid)
+    if hit and time.time() - hit[1] < 3600:
+        return hit[0]
+    if getattr(user, "bot", False):
+        ok = False
+    else:
+        m = user if getattr(user, "roles", None) else None
+        if m is None and guild is not None:
+            m = guild.get_member(uid)
+            if m is None:
+                try:
+                    m = await guild.fetch_member(uid)
+                except discord.NotFound:
+                    m = None  # left the server: their messages still count as a member's
+                except discord.HTTPException:
+                    return chat_member(user) if not isinstance(user, int) else True
+        ok = chat_member(m) if m is not None else (chat_member(user) if not isinstance(user, int) else True)
+    _chat_member_cache[uid] = (ok, time.time())
+    return ok
+
+
+async def community_top3(guild, week0: float) -> list[tuple[str, int]]:
+    """Top 3 members, re-checking everyone against their current roles (so staff never show up)."""
+    out = []
+    for uid, n in chat_stats.top(week0, 40):
+        if await is_chat_member(guild, int(uid)):
+            out.append((uid, n))
+        if len(out) == 3:
+            break
+    return out
+
+
+async def community_embed(week0: float, end: float, title: str, guild=None) -> discord.Embed:
+    top = await community_top3(guild, week0)
     lines = [f"{MEDALS[i]} <@{uid}> · **{n:,}** messages" for i, (uid, n) in enumerate(top)]
     e = discord.Embed(title=title, colour=0x22C55E,
                       description="\n".join(lines) or "No community messages yet this week.")
@@ -4012,13 +4066,15 @@ async def community_top(interaction: discord.Interaction, week: app_commands.Cho
     if STAFF_ROLE_IDS and not is_staff(interaction.user):
         await interaction.response.send_message("This command is for staff only.", ephemeral=True)
         return
+    await interaction.response.defer(ephemeral=private, thinking=True)
     now = time.time()
     this_start = uk_week_start(now)
     if week and week.value == "last":
-        e = community_embed(uk_week_start(this_start - 3600), this_start, "💬 Top chatters · last week")
+        e = await community_embed(uk_week_start(this_start - 3600), this_start, "💬 Top chatters · last week",
+                                  interaction.guild)
     else:
-        e = community_embed(this_start, now + 1, "💬 Top chatters · this week so far")
-    await interaction.response.send_message(embed=e, ephemeral=private, allowed_mentions=discord.AllowedMentions.none())
+        e = await community_embed(this_start, now + 1, "💬 Top chatters · this week so far", interaction.guild)
+    await interaction.followup.send(embed=e, ephemeral=private, allowed_mentions=discord.AllowedMentions.none())
 
 
 @community_group.command(name="postchannel", description="Post last week's top 3 chatters here every Monday at 9am")
@@ -4061,11 +4117,11 @@ async def leaderboard_loop():
             if cfg.get("community_channel") and now >= week0 + 9 * 3600 and cfg.get("community_posted", 0) < week0:
                 ch = bot.get_channel(cfg["community_channel"]) or await bot.fetch_channel(cfg["community_channel"])
                 start = uk_week_start(week0 - 3600)
-                winners = [int(u) for u, _ in chat_stats.top(start, 3)]
+                winners = [int(u) for u, _ in await community_top3(ch.guild, start)]
                 ping = cfg.get("community_ping", True) and winners
                 await ch.send(content=("Congrats to this week's top chatters! " + " ".join(f"<@{u}>" for u in winners))
                               if ping else None,
-                              embed=community_embed(start, week0, "💬 Top chatters · last week"),
+                              embed=await community_embed(start, week0, "💬 Top chatters · last week", ch.guild),
                               allowed_mentions=discord.AllowedMentions(users=[discord.Object(u) for u in winners])
                               if ping else discord.AllowedMentions.none())
                 cfg["community_posted"] = week0
