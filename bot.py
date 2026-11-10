@@ -2561,8 +2561,8 @@ class PayoutBugForm(discord.ui.Modal, title="Report a payout bug"):
         self.payout = discord.ui.TextInput(label="Payout ID or amount", placeholder="e.g. CSH-1792… or $1,500",
                                            max_length=80)
         self.problem = discord.ui.TextInput(label="What went wrong?", style=discord.TextStyle.paragraph,
-                                            placeholder="e.g. payout stuck on pending, wrong amount, not received, "
-                                                        "button not working", max_length=1000)
+                                            placeholder="e.g. wrong crypto address on my payout, $0 payout, wrong "
+                                                        "amount. (Just waiting? Use a payout ticket.)", max_length=1000)
         self.extra = discord.ui.TextInput(label="Wallet or transaction hash (optional)", required=False,
                                           max_length=150)
         for f in (self.username, self.email, self.payout, self.problem, self.extra):
@@ -3444,7 +3444,15 @@ async def panel(interaction: discord.Interaction, category: discord.CategoryChan
             f"1. Link your Discord to your Cashed account in your dashboard: {CASHED_LINK_URL}\n"
             "2. Press **Verify** to get the Verified role\n"
             "3. Press **Open payout ticket** and fill in the form\n\n"
-            "Problem with a payout you already requested (stuck, wrong amount, not received)? Press **Payout bug**.\n\n"
+            "**Payout ticket or payout bug?**\n"
+            "• Waiting on your payout, or it's past the expected time? That's a normal **payout ticket**, "
+            "not a bug.\n"
+            "• **Payout bug** is only for a real technical problem, like a wrong crypto address on your payout "
+            "or a $0 payout.\n\n"
+            "**Please note**\n"
+            "• You can only have **one ticket open** at a time.\n"
+            "• Tickets **close automatically after 48 hours** if we're waiting on your reply, to keep things "
+            "tidy. You can always open a new one.\n\n"
             "Only verified accounts can open payout tickets. Make sure your wallet address and network are correct."),
         colour=0x16A34A)
     v = discord.ui.View(timeout=None)
