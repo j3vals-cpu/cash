@@ -2793,6 +2793,8 @@ TRIAGE_NAMES = {"clean": os.getenv("TRIAGE_CLEAN_NAME", "Payout Support Verified
                 "flagged": os.getenv("TRIAGE_FLAG_NAME", "Payout Support Verified 3")}
 TRIAGE_OLD_NAMES = {"clean": "Payout Support Verified A", "check": "Payout Support Verified B",
                     "flagged": "Payout Support Verified C"}  # renamed in place on start
+TRIAGE_FILE = os.path.join(DATA_DIR, "triage.json")
+_triage_lock = asyncio.Lock()
 
 
 async def triage_rename_old(guild: discord.Guild):
