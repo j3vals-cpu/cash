@@ -3686,23 +3686,36 @@ CHAT_EXCLUDE_ROLE_WORDS = [w.strip().lower() for w in os.getenv(
     "CHAT_EXCLUDE_ROLE_WORDS", "mod,support,staff,admin,team,manager,owner,founder,dev,helper").split(",") if w.strip()]
 
 
-def chat_member(a) -> bool:
-    """A normal member for the community leaderboard. Anyone on the team is left out: bots, staff/mod role ids,
-    any role whose name says mod / support / staff / admin / team etc. (e.g. 'Cashed MOD', 'Support Agent'),
-    anyone with moderator permissions, and anyone with '| Cashed' in their name."""
+def chat_skip_reason(a) -> str | None:
+    """Why someone doesn't count on the community board, or None if they do."""
     if getattr(a, "bot", False):
-        return False
+        return "bot"
     roles = getattr(a, "roles", [])
-    if any(r.id in STAFF_ROLE_IDS or r.id in MOD_ROLE_IDS or r.id in CHAT_EXCLUDE_ROLE_IDS for r in roles):
-        return False
-    if any(w in r.name.lower() for r in roles for w in CHAT_EXCLUDE_ROLE_WORDS):
-        return False
+    for r in roles:
+        if r.id in STAFF_ROLE_IDS or r.id in MOD_ROLE_IDS or r.id in CHAT_EXCLUDE_ROLE_IDS:
+            return f"team role {r.name}"
+    for r in roles:
+        for w in CHAT_EXCLUDE_ROLE_WORDS:
+            if re.search(rf"\b{re.escape(w)}", r.name.lower()):
+                return f"role name '{r.name}' looks like a team role"
     p = getattr(a, "guild_permissions", None)
-    if p is not None and (p.administrator or p.manage_messages or p.moderate_members or p.kick_members
-                          or p.ban_members or p.manage_roles or p.manage_channels):
-        return False
+    if p is not None:
+        for k in ("administrator", "manage_messages", "moderate_members", "kick_members", "ban_members",
+                  "manage_roles", "manage_channels"):
+            if getattr(p, k, False):
+                return f"has {k.replace('_', ' ')} permission"
     name = f"{getattr(a, 'display_name', '')} {getattr(a, 'name', '')}".lower()
-    return "| cashed" not in name and "|cashed" not in name
+    if "| cashed" in name or "|cashed" in name:
+        return "'| Cashed' in their name"
+    return None
+
+
+def chat_member(a) -> bool:
+    """A normal member for the community leaderboard (see chat_skip_reason for who's left out)."""
+    return chat_skip_reason(a) is None
+
+
+_chat_recent: list[tuple[float, str, str]] = []  # last general-chat messages: (ts, name, counted / why not)
 
 
 def is_mod(member) -> bool:
@@ -3801,10 +3814,17 @@ async def on_message(message: discord.Message):
         ticket_replies.note(message)
     if message.author.bot:
         return
-    if message.channel.id in CHAT_CHANNEL_IDS and chat_member(message.author):
+    if message.channel.id in CHAT_CHANNEL_IDS:
         cfg = _board_cfg()
-        if cfg.get("community_on") and message.created_at.timestamp() >= cfg.get("community_since", 0):
+        why = chat_skip_reason(message.author)
+        if not cfg.get("community_on"):
+            why = "leaderboard is off"
+        elif message.created_at.timestamp() < cfg.get("community_since", 0):
+            why = "sent before it was turned on"
+        if why is None:
             chat_stats.add(message)
+        _chat_recent.append((message.created_at.timestamp(), message.author.display_name, why or "counted"))
+        del _chat_recent[:-20]
     if is_mod(message.author):
         ts = message.created_at.timestamp()
         mod_stats.add(message.author, message.channel, ts, in_ticket)
@@ -4095,6 +4115,20 @@ async def community_leaderboard(interaction: discord.Interaction, enabled: bool)
         msg = "Community leaderboard counting stopped."
     _board_save(cfg)
     await interaction.response.send_message(msg, ephemeral=True)
+
+
+@community_group.command(name="debug", description="Show the last messages in general and whether each one counted")
+async def community_debug(interaction: discord.Interaction):
+    if STAFF_ROLE_IDS and not is_staff(interaction.user):
+        await interaction.response.send_message("This command is for staff only.", ephemeral=True)
+        return
+    cfg = _board_cfg()
+    head = (f"Counting: **{'on' if cfg.get('community_on') else 'off'}**"
+            + (f" since <t:{int(cfg['community_since'])}:t>" if cfg.get("community_since") else "")
+            + f" · channels: {' '.join(f'<#{c}>' for c in CHAT_CHANNEL_IDS)}\n")
+    rows = [f"<t:{int(t)}:t> **{discord.utils.escape_markdown(n)}** · {why}" for t, n, why in reversed(_chat_recent)]
+    await interaction.response.send_message(head + ("\n".join(rows) or "No messages seen in general since the bot started."),
+                                            ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
 
 
 @community_group.command(name="postchannel", description="Post last week's top 3 chatters here every Monday at 9am")
