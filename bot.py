@@ -2878,6 +2878,19 @@ async def ticket_facts(ch: discord.TextChannel) -> dict:
     return f
 
 
+def _interview_list() -> tuple[set, set]:
+    """Jack's interview list (orange/yellow rows on the J3 sheet): these go to B."""
+    try:
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "interview_list.json"), encoding="utf-8") as fh:
+            d = json.load(fh)
+        return {n.lower() for n in d.get("names", [])}, {e.lower() for e in d.get("emails", [])}
+    except Exception:
+        return set(), set()
+
+
+INTERVIEW_NAMES, INTERVIEW_EMAILS = _interview_list()
+
+
 def classify_ticket(f: dict, member, watch: dict, keys: dict, review: dict, wallet_owners: dict) -> tuple[str, str]:
     """(status, reason). Exact matches only for 'flagged', so a similar name never lands someone in C."""
     names = {x.lower() for x in (f["username"], getattr(member, "name", ""), getattr(member, "global_name", "") or "",
@@ -2888,6 +2901,11 @@ def classify_ticket(f: dict, member, watch: dict, keys: dict, review: dict, wall
     for n in names:
         if n in watch:
             return "flagged", f"name matches hedger {n} in the report"
+    if f["email"] and f["email"] in INTERVIEW_EMAILS:
+        return "check", "on Jack's interview list (email)"
+    for n in names:
+        if n in INTERVIEW_NAMES:
+            return "check", f"on Jack's interview list ({n})"
     if by_key and by_key in review:
         return "check", f"email matches {by_key} (shared-IP review list)"
     for n in names:
