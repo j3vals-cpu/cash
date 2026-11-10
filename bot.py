@@ -306,12 +306,14 @@ class TicketBot(discord.Client):
         self.loop.create_task(daily_reset_loop())
         self.loop.create_task(rebuild_risk_from_category())
         self.loop.create_task(mod_stats.save_loop())
+        self.loop.create_task(chat_stats.save_loop())
         self.loop.create_task(briefing_loop())
         self.loop.create_task(extras.timer_loop())
         self.loop.create_task(tag_rule_on_start())
         self.loop.create_task(fud_rule_on_start())
         self.loop.create_task(jail_loop())
-        self.loop.create_task(idle_close_loop())  # close tickets where the trader stopped replying to staff
+        self.loop.create_task(idle_close_loop())
+        self.loop.create_task(leaderboard_loop())  # weekly mod leaderboard post  # close tickets where the trader stopped replying to staff
         self.loop.create_task(ultra_voice.ensure())  # download Ultra's voice in the background
         # Public API for the website's live payout feed (needs Railway public networking)
         import web_api
@@ -2721,6 +2723,7 @@ class CloseConfirm(discord.ui.View):
                                             ephemeral=True)
             return
         _bot_closing.add(self.ch.id)
+        mod_stats.event(interaction.user, "close")
         try:
             await self.ch.delete(reason=f"Closed by {interaction.user}")
         except discord.NotFound:
@@ -3505,6 +3508,26 @@ def active_time(times: list[float]) -> float:
     return total
 
 
+# Weekly leaderboard points: helping in tickets counts most, then closing them, then everything else.
+POINTS_TICKET, POINTS_CLOSE, POINTS_MUTE, MSGS_PER_POINT = 3, 2, 1, 10
+
+
+def mod_points(s: dict) -> int:
+    return (s["tickets"] * POINTS_TICKET + s["closes"] * POINTS_CLOSE + s["mutes"] * POINTS_MUTE
+            + s["c"] // MSGS_PER_POINT)
+
+
+def uk_week_start(ts: float) -> float:
+    """Monday 00:00 UK time of the week containing ts."""
+    day0 = uk_midnight(ts)
+    try:
+        from zoneinfo import ZoneInfo
+        wd = datetime.fromtimestamp(day0, ZoneInfo("Europe/London")).weekday()
+    except Exception:
+        wd = datetime.fromtimestamp(day0, timezone.utc).weekday()
+    return uk_midnight(day0 - wd * 86400 + 3 * 3600)  # +3h keeps it right across a clock change
+
+
 class ModStats:
     """Every mod message's time + channel (last 35 days), so any window can be counted exactly.
     Saved to /data so it survives restarts (needs the Railway volume)."""
@@ -3512,36 +3535,52 @@ class ModStats:
     FILE = os.path.join(DATA_DIR, "mod_activity.json")
 
     def __init__(self):
-        self.msgs: dict[str, list] = {}   # user id -> [[ts, channel id], ...] oldest first
+        self.msgs: dict[str, list] = {}   # user id -> [[ts, channel id, in a ticket 1/0], ...] oldest first
+        self.ev: dict[str, list] = {}     # user id -> [[ts, kind, value], ...]: close, mute, resp (seconds)
         self.names: dict[str, str] = {}
         self.dirty = False
         try:
             with open(self.FILE, encoding="utf-8") as f:
                 d = json.load(f)
-            self.msgs, self.names = d.get("msgs", {}), d.get("names", {})
+            self.msgs, self.names, self.ev = d.get("msgs", {}), d.get("names", {}), d.get("ev", {})
         except FileNotFoundError:
             pass
         except Exception:
             log.exception("Couldn't read mod stats")
 
-    def add(self, user, channel, ts: float):
-        self.msgs.setdefault(str(user.id), []).append([int(ts), getattr(channel, "id", 0)])
+    def add(self, user, channel, ts: float, ticket: bool = False):
+        self.msgs.setdefault(str(user.id), []).append([int(ts), getattr(channel, "id", 0), 1 if ticket else 0])
         self.names[str(user.id)] = user.display_name
+        self.dirty = True
+
+    def event(self, user, kind: str, value: float = 0, ts: float | None = None):
+        """kind: 'close' (closed a ticket), 'mute' (muted someone), 'resp' (seconds to answer a waiting trader)."""
+        self.ev.setdefault(str(user.id), []).append([int(ts or time.time()), kind, round(value, 1)])
+        self.names[str(user.id)] = getattr(user, "display_name", str(user))
         self.dirty = True
 
     def window(self, start: float, end: float) -> dict:
         """{user id: {c, act, days, first, last, top_channel, times}} for messages in [start, end)."""
         out = {}
-        for uid, rows in self.msgs.items():
-            rows = sorted((r for r in rows if start <= r[0] < end), key=lambda r: r[0])
-            if not rows:
+        for uid in set(self.msgs) | set(self.ev):
+            rows = sorted((r for r in self.msgs.get(uid, []) if start <= r[0] < end), key=lambda r: r[0])
+            evs = [e for e in self.ev.get(uid, []) if start <= e[0] < end]
+            if not rows and not evs:
                 continue
             times = [r[0] for r in rows]
             ch = {}
-            for _, cid in rows:
-                ch[cid] = ch.get(cid, 0) + 1
-            out[uid] = {"c": len(rows), "act": active_time(times), "first": times[0], "last": times[-1],
-                        "days": len({uk_day(t) for t in times}), "top": max(ch, key=ch.get), "times": times}
+            for r in rows:
+                ch[r[1]] = ch.get(r[1], 0) + 1
+            tk = [r for r in rows if len(r) > 2 and r[2]]
+            resp = sorted(e[2] for e in evs if e[1] == "resp")
+            s = {"c": len(rows), "act": active_time(times) if times else 0.0,
+                 "first": times[0] if times else 0, "last": times[-1] if times else 0,
+                 "days": len({uk_day(t) for t in times}), "top": max(ch, key=ch.get) if ch else 0, "times": times,
+                 "tk_msgs": len(tk), "tickets": len({r[1] for r in tk}), "gen": len(rows) - len(tk),
+                 "closes": sum(1 for e in evs if e[1] == "close"), "mutes": sum(1 for e in evs if e[1] == "mute"),
+                 "answered": len(resp), "resp_med": (resp[(len(resp) - 1) // 2] + resp[len(resp) // 2]) / 2 if resp else None}
+            s["points"] = mod_points(s)
+            out[uid] = s
         return out
 
     def save(self):
@@ -3550,11 +3589,13 @@ class ModStats:
         cutoff = time.time() - MOD_KEEP_DAYS * 86400
         self.msgs = {u: [r for r in rows if r[0] >= cutoff] for u, rows in self.msgs.items()}
         self.msgs = {u: rows for u, rows in self.msgs.items() if rows}
+        self.ev = {u: [e for e in rows if e[0] >= cutoff] for u, rows in self.ev.items()}
+        self.ev = {u: rows for u, rows in self.ev.items() if rows}
         try:
             os.makedirs(DATA_DIR, exist_ok=True)
             tmp = self.FILE + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
-                json.dump({"msgs": self.msgs, "names": self.names}, f, separators=(",", ":"))
+                json.dump({"msgs": self.msgs, "names": self.names, "ev": self.ev}, f, separators=(",", ":"))
             os.replace(tmp, self.FILE)
             self.dirty = False
         except Exception:
@@ -3567,6 +3608,67 @@ class ModStats:
 
 
 mod_stats = ModStats()
+
+
+class ChatStats:
+    """Community chatters per week (Monday-Sunday UK). Members only: staff, mods and bots aren't counted, nor are
+    ticket channels. At most one message per CHAT_COOLDOWN seconds counts, so spamming doesn't help."""
+
+    FILE = os.path.join(DATA_DIR, "chat_stats.json")
+    CHAT_COOLDOWN = 10
+
+    def __init__(self):
+        self.weeks: dict[str, dict[str, int]] = {}
+        self.names: dict[str, str] = {}
+        self._last: dict[int, float] = {}
+        self.dirty = False
+        try:
+            with open(self.FILE, encoding="utf-8") as f:
+                d = json.load(f)
+            self.weeks, self.names = d.get("weeks", {}), d.get("names", {})
+        except FileNotFoundError:
+            pass
+        except Exception:
+            log.exception("Couldn't read chat stats")
+
+    def add(self, message: discord.Message):
+        a = message.author
+        ts = message.created_at.timestamp()
+        if ts - self._last.get(a.id, 0) < self.CHAT_COOLDOWN:
+            return
+        self._last[a.id] = ts
+        wk = str(int(uk_week_start(ts)))
+        w = self.weeks.setdefault(wk, {})
+        w[str(a.id)] = w.get(str(a.id), 0) + 1
+        self.names[str(a.id)] = a.display_name
+        self.dirty = True
+
+    def top(self, week0: float, n: int = 3) -> list[tuple[str, int]]:
+        w = self.weeks.get(str(int(week0)), {})
+        return sorted(w.items(), key=lambda kv: kv[1], reverse=True)[:n]
+
+    def save(self):
+        if not self.dirty:
+            return
+        keep = sorted(self.weeks)[-8:]
+        self.weeks = {k: self.weeks[k] for k in keep}
+        try:
+            os.makedirs(DATA_DIR, exist_ok=True)
+            tmp = self.FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"weeks": self.weeks, "names": self.names}, f, separators=(",", ":"))
+            os.replace(tmp, self.FILE)
+            self.dirty = False
+        except Exception:
+            log.exception("Couldn't save chat stats")
+
+    async def save_loop(self):
+        while True:
+            await asyncio.sleep(60)
+            self.save()
+
+
+chat_stats = ChatStats()
 
 
 def is_mod(member) -> bool:
@@ -3659,12 +3761,19 @@ ticket_replies = TicketReplies()
 async def on_message(message: discord.Message):
     if message.guild is None:
         return
-    if is_ticket_channel(message.channel):
+    in_ticket = is_ticket_channel(message.channel)
+    prev = ticket_replies.last.get(message.channel.id) if in_ticket else None
+    if in_ticket:
         ticket_replies.note(message)
     if message.author.bot:
         return
+    if not in_ticket and not is_mod(message.author) and not is_staff(message.author):
+        chat_stats.add(message)
     if is_mod(message.author):
-        mod_stats.add(message.author, message.channel, message.created_at.timestamp())
+        ts = message.created_at.timestamp()
+        mod_stats.add(message.author, message.channel, ts, in_ticket)
+        if prev and not prev.get("staff"):  # the trader spoke last: this is a reply to someone waiting
+            mod_stats.event(message.author, "resp", ts - prev["ts"], ts)
     await tag_bypass_check(message)
 
 
@@ -3708,7 +3817,8 @@ async def mod_stat(interaction: discord.Interaction, period: app_commands.Choice
             for d, ts in sorted(by_day.items(), reverse=True):
                 lines.append(f"`{d}` · **{len(ts)}** messages · **{fmt_dur(active_time(ts))}** active · "
                              f"<t:{ts[0]}:t> - <t:{ts[-1]}:t>")
-        head = (f"**{s['c']}** messages · **{fmt_dur(s['act'])}** active · most in <#{s['top']}>\n\n"
+        head = ((f"**{s['c']}** messages · **{fmt_dur(s['act'])}** active"
+                 + (f" · most in <#{s['top']}>" if s['top'] else "") + "\n" + _mod_extra(s) + "\n\n")
                 if s else "No messages in this period.")
         e = discord.Embed(title=f"{member.display_name} · {label}", description=(head + "\n".join(lines))[:4000],
                           colour=0x3B82F6)
@@ -3721,20 +3831,199 @@ async def mod_stat(interaction: discord.Interaction, period: app_commands.Choice
     n_days = max(1, round((now - start) / 86400))
     lines = []
     for i, (uid, s) in enumerate(ranked, 1):
-        line = f"**{i}. <@{uid}>** · **{s['c']}** messages · **{fmt_dur(s['act'])}** active"
-        if short:
-            line += f"\n-# <t:{s['first']}:t> - <t:{s['last']}:t> · most in <#{s['top']}>"
-        else:
+        line = f"**{i}. <@{uid}>** · **{s['c']}** messages · **{fmt_dur(s['act'])}** active\n-# {_mod_extra(s)}"
+        where = f" · most in <#{s['top']}>" if s["top"] else ""
+        if short and s["times"]:
+            line += f"\n-# <t:{s['first']}:t> - <t:{s['last']}:t>{where}"
+        elif s["days"]:
             line += (f"\n-# active {s['days']}/{n_days} days · avg {s['c'] // s['days']} msgs, "
-                     f"{fmt_dur(s['act'] / s['days'])} per active day · most in <#{s['top']}>")
+                     f"{fmt_dur(s['act'] / s['days'])} per active day{where}")
         lines.append(line)
     head = (f"**{len(ranked)}** mods · **{sum(s['c'] for _, s in ranked)}** messages · "
             f"**{fmt_dur(sum(s['act'] for _, s in ranked))}** active in total\n"
             f"-# Since <t:{int(start)}:f>\n")
     embeds = _chunks(f"Mod activity · {label}", [head] + (lines or ["No mod messages in this period."]), 0x3B82F6)
-    embeds[-1].set_footer(text=f"Counts every message from the mod role. {gap_note} Mods with 0 messages aren't listed.")
+    embeds[-1].set_footer(text=f"Counts every message from the mod role. {gap_note} Reply time = how long a trader "
+                               f"waited when the mod answered them (median). Mods with no activity aren't listed.")
     await interaction.response.send_message(embeds=embeds[:10], ephemeral=private,
                                             allowed_mentions=discord.AllowedMentions.none())
+
+
+def _mod_extra(s: dict) -> str:
+    resp = fmt_dur(s["resp_med"]) if s.get("resp_med") is not None else "-"
+    return (f"🎫 {s['tickets']} tickets helped ({s['tk_msgs']} msgs) · 💬 {s['gen']} other msgs · "
+            f"✅ {s['closes']} closed · 🔇 {s['mutes']} mutes · ⏱️ reply time {resp} ({s['answered']} answered) · "
+            f"⭐ {s['points']} pts")
+
+
+MEDALS = ["🥇", "🥈", "🥉"]
+
+
+def leaderboard_embed(start: float, end: float, title: str) -> discord.Embed:
+    stats = mod_stats.window(start, end)
+    ranked = sorted(stats.items(), key=lambda kv: (kv[1]["points"], kv[1]["tickets"], kv[1]["c"]), reverse=True)
+    lines = []
+    for i, (uid, s) in enumerate(ranked, 1):
+        badge = MEDALS[i - 1] if i <= 3 else f"**{i}.**"
+        resp = fmt_dur(s["resp_med"]) if s.get("resp_med") is not None else "-"
+        lines.append(f"{badge} <@{uid}> · **{s['points']} pts**\n"
+                     f"-# 🎫 {s['tickets']} tickets · ✅ {s['closes']} closed · 💬 {s['c']} msgs · "
+                     f"⏱️ {fmt_dur(s['act'])} active · reply time {resp} · 🔇 {s['mutes']} mutes")
+    if ranked:
+        tot = lambda k: sum(x[k] for _, x in ranked)
+        lines.append(f"\n**Team:** {tot('tickets')} tickets helped · {tot('closes')} closed · {tot('c')} messages · "
+                     f"{fmt_dur(tot('act'))} active")
+        fast = [(u, x) for u, x in ranked if x.get("resp_med") is not None and x["answered"] >= 3]
+        if fast:
+            u, x = min(fast, key=lambda kv: kv[1]["resp_med"])
+            lines.append(f"⚡ Fastest replies: <@{u}> ({fmt_dur(x['resp_med'])} median)")
+    e = discord.Embed(title=title, description="\n".join(lines)[:4000] or "No mod activity this week.",
+                      colour=0xF59E0B)
+    e.add_field(name="Period", value=f"<t:{int(start)}:D> to <t:{int(end) - 1}:D>", inline=False)
+    e.set_footer(text=f"Points: {POINTS_TICKET} per ticket helped · {POINTS_CLOSE} per ticket closed · "
+                      f"{POINTS_MUTE} per mute · 1 per {MSGS_PER_POINT} messages")
+    return e
+
+
+BOARD_FILE = os.path.join(DATA_DIR, "mod_board.json")
+
+
+def _board_cfg() -> dict:
+    try:
+        with open(BOARD_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _board_save(cfg: dict):
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        with open(BOARD_FILE, "w", encoding="utf-8") as f:
+            json.dump(cfg, f)
+    except Exception:
+        log.exception("Couldn't save leaderboard settings")
+
+
+@mod_group.command(name="leaderboard", description="Weekly mod leaderboard (Monday to Sunday, UK time)")
+@app_commands.describe(week="Which week (default: this week so far)", private="Only you can see it")
+@app_commands.choices(week=[app_commands.Choice(name="This week", value="this"),
+                            app_commands.Choice(name="Last week", value="last")])
+async def mod_leaderboard(interaction: discord.Interaction, week: app_commands.Choice[str] = None, private: bool = False):
+    if STAFF_ROLE_IDS and not is_staff(interaction.user):
+        await interaction.response.send_message("This command is for staff only.", ephemeral=True)
+        return
+    now = time.time()
+    this_start = uk_week_start(now)
+    if week and week.value == "last":
+        start = uk_week_start(this_start - 3600)
+        e = leaderboard_embed(start, this_start, "🏆 Mod leaderboard · last week")
+    else:
+        e = leaderboard_embed(this_start, now + 1, "🏆 Mod leaderboard · this week so far")
+    await interaction.response.send_message(embed=e, ephemeral=private, allowed_mentions=discord.AllowedMentions.none())
+
+
+@mod_group.command(name="leaderboardchannel", description="Post last week's mod leaderboard here every Monday at 9am")
+@app_commands.describe(enabled="On: post here every Monday. Off: stop the weekly post.")
+async def mod_leaderboard_channel(interaction: discord.Interaction, enabled: bool = True):
+    if STAFF_ROLE_IDS and not is_staff(interaction.user):
+        await interaction.response.send_message("This command is for staff only.", ephemeral=True)
+        return
+    cfg = _board_cfg()
+    if enabled:
+        cfg["channel"] = interaction.channel_id
+        cfg.setdefault("posted", uk_week_start(time.time()))  # don't post an old week straight away
+        msg = f"The weekly mod leaderboard will be posted in {interaction.channel.mention} every Monday at 9am (UK)."
+    else:
+        cfg.pop("channel", None)
+        msg = "Weekly mod leaderboard post turned off."
+    _board_save(cfg)
+    await interaction.response.send_message(msg, ephemeral=True)
+
+
+def community_embed(week0: float, end: float, title: str) -> discord.Embed:
+    top = chat_stats.top(week0, 3)
+    lines = [f"{MEDALS[i]} <@{uid}> · **{n:,}** messages" for i, (uid, n) in enumerate(top)]
+    e = discord.Embed(title=title, colour=0x22C55E,
+                      description="\n".join(lines) or "No community messages yet this week.")
+    e.add_field(name="Period", value=f"<t:{int(week0)}:D> to <t:{int(end) - 1}:D>", inline=False)
+    e.set_footer(text=f"Members only: staff and bots aren't counted. Ticket messages don't count, and only one "
+                      f"message every {ChatStats.CHAT_COOLDOWN}s counts, so spamming won't help.")
+    return e
+
+
+community_group = app_commands.Group(name="community", description="Community chat leaderboard")
+
+
+@community_group.command(name="top", description="Top 3 community chatters this week (staff not included)")
+@app_commands.describe(week="Which week (default: this week so far)", private="Only you can see it")
+@app_commands.choices(week=[app_commands.Choice(name="This week", value="this"),
+                            app_commands.Choice(name="Last week", value="last")])
+async def community_top(interaction: discord.Interaction, week: app_commands.Choice[str] = None, private: bool = False):
+    if STAFF_ROLE_IDS and not is_staff(interaction.user):
+        await interaction.response.send_message("This command is for staff only.", ephemeral=True)
+        return
+    now = time.time()
+    this_start = uk_week_start(now)
+    if week and week.value == "last":
+        e = community_embed(uk_week_start(this_start - 3600), this_start, "💬 Top chatters · last week")
+    else:
+        e = community_embed(this_start, now + 1, "💬 Top chatters · this week so far")
+    await interaction.response.send_message(embed=e, ephemeral=private, allowed_mentions=discord.AllowedMentions.none())
+
+
+@community_group.command(name="postchannel", description="Post last week's top 3 chatters here every Monday at 9am")
+@app_commands.describe(enabled="On: post here every Monday. Off: stop the weekly post.",
+                       ping="Tag the winners in the post (default: on)")
+async def community_post_channel(interaction: discord.Interaction, enabled: bool = True, ping: bool = True):
+    if STAFF_ROLE_IDS and not is_staff(interaction.user):
+        await interaction.response.send_message("This command is for staff only.", ephemeral=True)
+        return
+    cfg = _board_cfg()
+    if enabled:
+        cfg["community_channel"], cfg["community_ping"] = interaction.channel_id, ping
+        cfg.setdefault("community_posted", uk_week_start(time.time()))
+        msg = f"Top 3 chatters will be posted in {interaction.channel.mention} every Monday at 9am (UK)."
+    else:
+        cfg.pop("community_channel", None)
+        msg = "Weekly top chatters post turned off."
+    _board_save(cfg)
+    await interaction.response.send_message(msg, ephemeral=True)
+
+
+bot.tree.add_command(community_group)
+
+
+async def leaderboard_loop():
+    """Every Monday from 9am UK, post the previous week's board once."""
+    await bot.wait_until_ready()
+    while True:
+        try:
+            cfg = _board_cfg()
+            now = time.time()
+            week0 = uk_week_start(now)
+            if cfg.get("channel") and now >= week0 + 9 * 3600 and cfg.get("posted", 0) < week0:
+                ch = bot.get_channel(cfg["channel"]) or await bot.fetch_channel(cfg["channel"])
+                start = uk_week_start(week0 - 3600)
+                await ch.send(embed=leaderboard_embed(start, week0, "🏆 Mod leaderboard · last week"),
+                              allowed_mentions=discord.AllowedMentions.none())
+                cfg["posted"] = week0
+                _board_save(cfg)
+            if cfg.get("community_channel") and now >= week0 + 9 * 3600 and cfg.get("community_posted", 0) < week0:
+                ch = bot.get_channel(cfg["community_channel"]) or await bot.fetch_channel(cfg["community_channel"])
+                start = uk_week_start(week0 - 3600)
+                winners = [int(u) for u, _ in chat_stats.top(start, 3)]
+                ping = cfg.get("community_ping", True) and winners
+                await ch.send(content=("Congrats to this week's top chatters! " + " ".join(f"<@{u}>" for u in winners))
+                              if ping else None,
+                              embed=community_embed(start, week0, "💬 Top chatters · last week"),
+                              allowed_mentions=discord.AllowedMentions(users=[discord.Object(u) for u in winners])
+                              if ping else discord.AllowedMentions.none())
+                cfg["community_posted"] = week0
+                _board_save(cfg)
+        except Exception:
+            log.exception("Weekly leaderboard post failed")
+        await asyncio.sleep(600)
 
 
 bot.tree.add_command(mod_group)
@@ -4255,6 +4544,7 @@ async def _do_mute(interaction: discord.Interaction, member: discord.Member, sec
         await interaction.followup.send("The bot needs **Manage Roles** and **Manage Channels**, and its role must "
                                         "be above the muted role.", ephemeral=True)
         return
+    mod_stats.event(interaction.user, "mute")
     cfg = fud_store.get(guild.id)
     cfg.setdefault("jailed", {})[str(member.id)] = time.time() + secs if secs else 0
     fud_store.save()
