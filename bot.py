@@ -3073,6 +3073,49 @@ async def sort_ticket_categories(guild: discord.Guild) -> int:
     return done
 
 
+async def clean_empty_categories(guild: discord.Guild) -> list[str]:
+    """Delete empty overflow categories: '<payout category> 2', '<bug category> 2', ... and extra 1/2/3 overflows.
+    Never touches the main payout or bug category, the first 1/2/3 categories, the hedge category, or anything
+    with a channel in it."""
+    keep = {PAYOUT_TICKET_CATEGORY_ID, PAYOUT_BUG_CATEGORY_ID, HEDGE_CATEGORY_ID}
+    for ids in _triage.get("cats", {}).values():
+        if ids:
+            keep.add(ids[0])
+    bases = [guild.get_channel(i) for i in (PAYOUT_TICKET_CATEGORY_ID, PAYOUT_BUG_CATEGORY_ID)]
+    bases = [b for b in bases if isinstance(b, discord.CategoryChannel)]
+    triage_extra = {i for ids in _triage.get("cats", {}).values() for i in ids[1:]}
+    gone = []
+    for cat in list(guild.categories):
+        if cat.id in keep or cat.channels:
+            continue
+        overflow = cat.id in triage_extra or any(re.fullmatch(re.escape(b.name) + r" \d+", cat.name) for b in bases)
+        if not overflow:
+            continue
+        try:
+            await cat.delete(reason="Empty ticket overflow category")
+            gone.append(cat.name)
+            for ids in _triage.get("cats", {}).values():
+                if cat.id in ids:
+                    ids.remove(cat.id)
+        except discord.HTTPException:
+            log.warning("Couldn't delete empty category %s", cat.name, exc_info=True)
+        await asyncio.sleep(1)
+    if gone:
+        _triage_save(_triage)
+    return gone
+
+
+@bot.tree.command(name="cleancategories", description="Delete empty ticket overflow categories")
+async def cleancategories(interaction: discord.Interaction):
+    if not (interaction.user.guild_permissions.administrator or is_staff(interaction.user)):
+        await interaction.response.send_message("Staff only.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    gone = await clean_empty_categories(interaction.guild)
+    await interaction.followup.send(("Deleted " + ", ".join(f"**{g}**" for g in gone)) if gone
+                                    else "No empty overflow categories to delete.", ephemeral=True)
+
+
 async def ticket_sort_loop():
     await bot.wait_until_ready()
     await asyncio.sleep(60)
@@ -3080,6 +3123,7 @@ async def ticket_sort_loop():
         for g in bot.guilds:
             try:
                 await sort_ticket_categories(g)
+                await clean_empty_categories(g)
             except Exception:
                 log.exception("Ticket sort failed")
         await asyncio.sleep(10 * 60)
