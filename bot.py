@@ -3089,6 +3089,24 @@ async def clean_empty_categories(guild: discord.Guild) -> list[str]:
         cs = [c for c in cs if isinstance(c, discord.CategoryChannel)]
         cs.sort(key=lambda c: (len(c.channels) == 0, c.position))
         ids[:] = [c.id for c in cs]
+    # merge: if a status has two categories and they fit in one (50 max), move the tickets into the main one
+    for st, ids in _triage.get("cats", {}).items():
+        cs = [guild.get_channel(i) for i in ids]
+        cs = [c for c in cs if isinstance(c, discord.CategoryChannel)]
+        if len(cs) < 2:
+            continue
+        main = cs[0]
+        for extra in cs[1:]:
+            for ch in list(extra.channels):
+                if len(main.channels) >= 50:
+                    break
+                try:
+                    if our_ticket(ch):
+                        _triage_moving.add(ch.id)
+                    await ch.edit(category=main, sync_permissions=False, reason="Merging duplicate ticket category")
+                except discord.HTTPException:
+                    log.warning("Couldn't merge #%s", ch.name, exc_info=True)
+                await asyncio.sleep(1)
     keep = {PAYOUT_TICKET_CATEGORY_ID, PAYOUT_BUG_CATEGORY_ID, HEDGE_CATEGORY_ID} | \
         {ids[0] for ids in _triage.get("cats", {}).values() if ids}
     triage_extra = {i for ids in _triage.get("cats", {}).values() for i in ids[1:]}
