@@ -313,6 +313,7 @@ class TicketBot(discord.Client):
         self.loop.create_task(fud_rule_on_start())
         self.loop.create_task(jail_loop())
         self.loop.create_task(idle_close_loop())
+        self.loop.create_task(ticket_sort_loop())  # tickets oldest to newest, every 10 minutes
         self.loop.create_task(leaderboard_loop())  # weekly mod leaderboard post  # close tickets where the trader stopped replying to staff
         self.loop.create_task(ultra_voice.ensure())  # download Ultra's voice in the background
         # Public API for the website's live payout feed (needs Railway public networking)
@@ -2766,6 +2767,54 @@ def close_view() -> discord.ui.View:
     v = discord.ui.View(timeout=None)
     v.add_item(CloseTicketButton())
     return v
+
+
+# ---- keep tickets in order: oldest at the top of each ticket category, newest at the bottom
+
+async def sort_ticket_categories(guild: discord.Guild) -> int:
+    """Reorder every category that holds tickets: other channels stay first, then tickets oldest to newest.
+    Only sends an update when the order is actually wrong. Returns how many categories were reordered."""
+    done = 0
+    cats = {c.category for c in guild.text_channels if our_ticket(c) and c.category}
+    for cat in cats:
+        chans = sorted(cat.text_channels, key=lambda c: c.position)
+        others = [c for c in chans if not our_ticket(c)]
+        tickets = sorted((c for c in chans if our_ticket(c)), key=lambda c: c.created_at)
+        want = others + tickets
+        if [c.id for c in want] == [c.id for c in chans]:
+            continue
+        slots = [c.position for c in chans]
+        payload = [{"id": c.id, "position": pos} for c, pos in zip(want, slots)]
+        try:
+            await bot.http.bulk_channel_update(guild.id, payload, reason="Sort tickets oldest to newest")
+            done += 1
+        except discord.HTTPException:
+            log.warning("Couldn't sort tickets in %s", cat.name, exc_info=True)
+        await asyncio.sleep(2)
+    return done
+
+
+async def ticket_sort_loop():
+    await bot.wait_until_ready()
+    await asyncio.sleep(60)
+    while True:
+        for g in bot.guilds:
+            try:
+                await sort_ticket_categories(g)
+            except Exception:
+                log.exception("Ticket sort failed")
+        await asyncio.sleep(10 * 60)
+
+
+@bot.tree.command(name="sorttickets", description="Put tickets in order: oldest at the top, newest at the bottom")
+async def sorttickets(interaction: discord.Interaction):
+    if not (interaction.user.guild_permissions.administrator or is_staff(interaction.user)):
+        await interaction.response.send_message("Staff only.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    n = await sort_ticket_categories(interaction.guild)
+    await interaction.followup.send(f"Done. Reordered {n} categor{'y' if n == 1 else 'ies'}: oldest tickets at the top."
+                                    if n else "Tickets were already in order (oldest at the top).", ephemeral=True)
 
 
 @bot.tree.command(name="close", description="Save the transcript and close this payout ticket")
