@@ -4616,6 +4616,21 @@ FUD_TIMEOUT = timedelta(hours=1)
 _fud_strikes: dict[int, list[float]] = {}
 
 
+async def _fud_private(guild, member, text: str):
+    """Tell only them: DM, or their own ticket if their DMs are closed. Nobody else sees it."""
+    try:
+        await member.send(text)
+        return
+    except discord.HTTPException:
+        pass
+    tk = any_open_ticket(guild, member.id)
+    if tk:
+        try:
+            await tk.send(f"{member.mention} {text}", allowed_mentions=discord.AllowedMentions(users=[member]))
+        except discord.HTTPException:
+            pass
+
+
 async def fud_strike(guild: discord.Guild, user_id: int, channel):
     """Payout complaint blocked again and again (rewording it to get past the filter):
     2nd block in 30 min = warning, 3rd = muted in general for 1 hour (like /jail: tickets still work)."""
@@ -4633,18 +4648,9 @@ async def fud_strike(guild: discord.Guild, user_id: int, channel):
     tickets = fud_store.get(guild.id).get("ticket_channel")
     where = f"<#{tickets}>" if tickets else "a payout ticket"
     if len(hits) == 2:
-        text = (f"{member.mention} payout questions go in {where}, not general. Rewording it to get past the "
-                f"filter won't work. **Next time you'll be muted in general for 1 hour.**")
-        if channel is not None:
-            try:
-                await channel.send(text, delete_after=20, allowed_mentions=discord.AllowedMentions(users=[member]))
-            except discord.HTTPException:
-                pass
-        try:
-            await member.send(f"Warning from **{guild.name}**: payout questions go in a payout ticket, not general. "
-                              f"If you try again you'll be muted in general for 1 hour (tickets will still work).")
-        except discord.HTTPException:
-            pass
+        await _fud_private(guild, member, f"Warning from **{guild.name}**: payout questions go in {where}, not "
+                           f"general. Rewording it to get past the filter won't work. If you try again you'll be "
+                           f"muted in general for 1 hour (tickets will still work).")
         await fud_log(guild, member, channel, "", "Warned: kept trying to post payout complaints in general", 0xF59E0B)
         return
     secs = int(FUD_TIMEOUT.total_seconds())
@@ -4663,18 +4669,9 @@ async def fud_strike(guild: discord.Guild, user_id: int, channel):
     fud_store.save()
     mod_stats.event(guild.me, "mute")
     _fud_strikes.pop(user_id, None)
-    if channel is not None:
-        try:
-            await channel.send(f"{member.mention} has been muted in general for 1 hour for repeatedly posting payout "
-                               f"complaints here. They can still use {where}.", delete_after=30,
-                               allowed_mentions=discord.AllowedMentions.none())
-        except discord.HTTPException:
-            pass
-    try:
-        await member.send(f"You've been muted in general on **{guild.name}** for 1 hour for repeatedly posting payout "
-                          f"complaints there. You can still open and use tickets if you need help with your payout.")
-    except discord.HTTPException:
-        pass
+    await _fud_private(guild, member, f"You've been muted in general on **{guild.name}** for 1 hour for "
+                       f"repeatedly posting payout complaints there. You can still open and use tickets if you need "
+                       f"help with your payout.")
     await fud_log(guild, member, channel, "", "Muted in general 1 hour: kept trying to get payout complaints past the "
                   "filter (tickets still work)", 0x7C3AED)
 
