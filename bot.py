@@ -2782,17 +2782,34 @@ def close_view() -> discord.ui.View:
 
 # --------------------------------------------------------------------------- #
 # Auto-sort payout tickets into three neutral-looking categories. Traders only see
-# "Payout Support Verified A / B / C" (like overflow), never why.
-#   A = clean (Sam can pay)   B = check (Jack to look / interview)   C = flagged (hedging / rule broken)
-# Nothing is posted in the ticket. Staff moving a ticket by hand between A/B/C is remembered and never undone.
+# "Payout Support Verified 1 / 2 / 3" (like overflow), never why.
+#   1 = clean (Sam can pay)   2 = check (Jack to look / interview)   3 = flagged (hedging / rule broken)
+# Nothing is posted in the ticket. Staff moving a ticket by hand between 1/2/3 is remembered and never undone.
 # --------------------------------------------------------------------------- #
 
 TRIAGE_ON = os.getenv("TRIAGE_ON", "1") not in ("0", "false", "off", "")
-TRIAGE_NAMES = {"clean": os.getenv("TRIAGE_CLEAN_NAME", "Payout Support Verified A"),
-                "check": os.getenv("TRIAGE_CHECK_NAME", "Payout Support Verified B"),
-                "flagged": os.getenv("TRIAGE_FLAG_NAME", "Payout Support Verified C")}
-TRIAGE_FILE = os.path.join(DATA_DIR, "triage.json")
-_triage_lock = asyncio.Lock()
+TRIAGE_NAMES = {"clean": os.getenv("TRIAGE_CLEAN_NAME", "Payout Support Verified 1"),
+                "check": os.getenv("TRIAGE_CHECK_NAME", "Payout Support Verified 2"),
+                "flagged": os.getenv("TRIAGE_FLAG_NAME", "Payout Support Verified 3")}
+TRIAGE_OLD_NAMES = {"clean": "Payout Support Verified A", "check": "Payout Support Verified B",
+                    "flagged": "Payout Support Verified C"}  # renamed in place on start
+
+
+async def triage_rename_old(guild: discord.Guild):
+    """The first version used A / B / C: rename those to 1 / 2 / 3 and keep using them (tickets stay put)."""
+    cats = _triage.setdefault("cats", {})
+    for st, old in TRIAGE_OLD_NAMES.items():
+        for cat in sorted(guild.categories, key=lambda c: c.position):
+            m = re.fullmatch(re.escape(old) + r"( \d+)?", cat.name)
+            if not m:
+                continue
+            if cat.id not in cats.setdefault(st, []):
+                cats[st].append(cat.id)
+            try:
+                await cat.edit(name=TRIAGE_NAMES[st] + (m.group(1) or ""), reason="Ticket categories renamed to 1/2/3")
+            except discord.HTTPException:
+                log.warning("Couldn't rename %s", cat.name, exc_info=True)
+    _triage_save(_triage)
 
 
 def _triage_load() -> dict:
@@ -2817,33 +2834,38 @@ _triage_moving: set[int] = set()    # channels the bot itself is moving (so it i
 
 
 def _status_of_category(cat) -> str | None:
+    """Which of 1/2/3 a category is. Tracked by the categories' IDs (not their names), so an existing overflow
+    category that happens to share a name is never mistaken for one."""
     if cat is None:
         return None
-    for st, nm in TRIAGE_NAMES.items():
-        if cat.name == nm or re.fullmatch(re.escape(nm) + r" \d+", cat.name):
+    for st, ids in _triage.get("cats", {}).items():
+        if cat.id in ids:
             return st
     return None
 
 
 async def triage_category(guild: discord.Guild, status: str) -> discord.CategoryChannel | None:
     """The category for a status, made (with the payout category's permissions) if it doesn't exist yet,
-    with its own overflow ('Payout Support Verified A 2', ...) when it has 50 channels."""
+    with its own overflow ('Payout Support Verified 1 2', ...) when it has 50 channels."""
     name = TRIAGE_NAMES[status]
     async with _overflow_lock:
-        n = 1
-        while True:
-            nm = name if n == 1 else f"{name} {n}"
-            cat = discord.utils.get(guild.categories, name=nm)
-            if cat is None:
-                base = guild.get_channel(PAYOUT_TICKET_CATEGORY_ID)
-                over = base.overwrites if isinstance(base, discord.CategoryChannel) else {
-                    guild.default_role: discord.PermissionOverwrite(view_channel=False)}
-                pos = (base.position + 1) if isinstance(base, discord.CategoryChannel) else None
-                kw = {"position": pos} if pos is not None else {}
-                return await guild.create_category(nm, overwrites=over, reason="Payout ticket sorting", **kw)
+        ids = _triage.setdefault("cats", {}).setdefault(status, [])
+        live = [guild.get_channel(i) for i in ids]
+        live = [c for c in live if isinstance(c, discord.CategoryChannel)]
+        ids[:] = [c.id for c in live]
+        for cat in live:
             if len(cat.channels) < 50:
                 return cat
-            n += 1
+        base = guild.get_channel(PAYOUT_TICKET_CATEGORY_ID)
+        over = base.overwrites if isinstance(base, discord.CategoryChannel) else {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False)}
+        nm = name if not live else f"{name} {len(live) + 1}"
+        after = live[-1] if live else (base if isinstance(base, discord.CategoryChannel) else None)
+        kw = {"position": after.position + 1} if after else {}
+        cat = await guild.create_category(nm, overwrites=over, reason="Payout ticket sorting", **kw)
+        ids.append(cat.id)
+        _triage_save(_triage)
+        return cat
 
 
 async def ticket_facts(ch: discord.TextChannel) -> dict:
@@ -2985,6 +3007,8 @@ def triage_manual_move(before, after):
 
 async def triage_loop():
     await bot.wait_until_ready()
+    for g in bot.guilds:
+        await triage_rename_old(g)
     await asyncio.sleep(90)
     while True:
         for g in bot.guilds:
@@ -2997,7 +3021,7 @@ async def triage_loop():
         await asyncio.sleep(30 * 60)
 
 
-@bot.tree.command(name="ticketsort", description="Staff: sort payout tickets into A (clean), B (check), C (flagged)")
+@bot.tree.command(name="ticketsort", description="Staff: sort payout tickets into 1 (clean), 2 (check), 3 (flagged)")
 @app_commands.describe(show="Just list where each ticket is and why (moves nothing)")
 async def ticketsort(interaction: discord.Interaction, show: bool = False):
     if not (interaction.user.guild_permissions.administrator or is_staff(interaction.user)):
@@ -3007,17 +3031,17 @@ async def ticketsort(interaction: discord.Interaction, show: bool = False):
     if not show:
         moved = await triage_pass(interaction.guild)
         await sort_ticket_categories(interaction.guild)
-        head = (f"Sorted. Moved {moved.get('clean', 0)} to A (clean), {moved.get('check', 0)} to B (check), "
-                f"{moved.get('flagged', 0)} to C (flagged). Oldest at the top.\n")
+        head = (f"Sorted. Moved {moved.get('clean', 0)} to 1 (clean), {moved.get('check', 0)} to 2 (check), "
+                f"{moved.get('flagged', 0)} to 3 (flagged). Oldest at the top.\n")
     else:
         head = ""
     rows = {"flagged": [], "check": []}
     for cid, r in _triage.get("tickets", {}).items():
         if r.get("status") in rows:
             rows[r["status"]].append(f"<#{cid}> · {r.get('why', '')}" + (" *(placed by staff)*" if r.get("manual") else ""))
-    txt = head + "**C · flagged**\n" + ("\n".join(rows["flagged"]) or "none") + \
-        "\n\n**B · check**\n" + ("\n".join(rows["check"]) or "none") + \
-        "\n\n-# Everything else is in A (clean). Staff can drag a ticket between A/B/C and the bot will leave it there."
+    txt = head + "**3 · flagged**\n" + ("\n".join(rows["flagged"]) or "none") + \
+        "\n\n**2 · check**\n" + ("\n".join(rows["check"]) or "none") + \
+        "\n\n-# Everything else is in 1 (clean). Staff can drag a ticket between 1/2/3 and the bot will leave it there."
     for i in range(0, len(txt), 1900):
         await interaction.followup.send(txt[i:i + 1900], ephemeral=True)
 
