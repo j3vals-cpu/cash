@@ -307,6 +307,7 @@ class TicketBot(discord.Client):
         self.loop.create_task(rebuild_risk_from_category())
         self.loop.create_task(mod_stats.save_loop())
         self.loop.create_task(chat_stats.save_loop())
+        self.loop.create_task(chat_backfill())  # rebuild this week's chat counts from history
         self.loop.create_task(briefing_loop())
         self.loop.create_task(extras.timer_loop())
         self.loop.create_task(tag_rule_on_start())
@@ -3671,6 +3672,54 @@ class ChatStats:
 chat_stats = ChatStats()
 
 
+def chat_ticket(ch) -> bool:
+    """Ticket channels don't count towards the chat board. Checked by the ticket itself, not its category name,
+    so a channel like general-chat is never mistaken for a ticket."""
+    return our_ticket(ch) or (getattr(ch, "name", "") or "").startswith(("payout-", "bug-", "ticket-", "closed-"))
+
+
+def chat_member(a) -> bool:
+    """A normal member for the chat leaderboard: not a bot, not an admin, no staff or mod role.
+    (Stricter than is_staff, which also counts any role ranked above the staff roles.)"""
+    if getattr(a, "bot", False):
+        return False
+    perms = getattr(a, "guild_permissions", None)
+    if perms is not None and perms.administrator:
+        return False
+    return not any(r.id in STAFF_ROLE_IDS or r.id in MOD_ROLE_IDS for r in getattr(a, "roles", []))
+
+
+async def chat_backfill():
+    """Count this week's messages from channel history, so the board is right even after a restart or deploy."""
+    await bot.wait_until_ready()
+    await asyncio.sleep(30)
+    week0 = uk_week_start(time.time())
+    after = datetime.fromtimestamp(week0, timezone.utc)
+    counts: dict[str, int] = {}
+    for g in bot.guilds:
+        for ch in g.text_channels:
+            if chat_ticket(ch) or not ch.permissions_for(g.me).read_message_history:
+                continue
+            last: dict[int, float] = {}
+            try:
+                async for m in ch.history(after=after, limit=20000, oldest_first=True):
+                    if not chat_member(m.author):
+                        continue
+                    ts = m.created_at.timestamp()
+                    if ts - last.get(m.author.id, 0) < ChatStats.CHAT_COOLDOWN:
+                        continue
+                    last[m.author.id] = ts
+                    counts[str(m.author.id)] = counts.get(str(m.author.id), 0) + 1
+                    chat_stats.names[str(m.author.id)] = m.author.display_name
+            except discord.HTTPException:
+                continue
+    if counts:
+        chat_stats.weeks[str(int(week0))] = counts
+        chat_stats.dirty = True
+        chat_stats.save()
+    log.info("Chat leaderboard backfilled: %d members this week", len(counts))
+
+
 def is_mod(member) -> bool:
     return any(r.id in MOD_ROLE_IDS for r in getattr(member, "roles", []))
 
@@ -3767,7 +3816,7 @@ async def on_message(message: discord.Message):
         ticket_replies.note(message)
     if message.author.bot:
         return
-    if not in_ticket and not is_mod(message.author) and not is_staff(message.author):
+    if not chat_ticket(message.channel) and chat_member(message.author):
         chat_stats.add(message)
     if is_mod(message.author):
         ts = message.created_at.timestamp()
