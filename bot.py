@@ -313,7 +313,8 @@ class TicketBot(discord.Client):
         self.loop.create_task(fud_rule_on_start())
         self.loop.create_task(jail_loop())
         self.loop.create_task(idle_close_loop())
-        self.loop.create_task(ticket_sort_loop())  # tickets oldest to newest, every 10 minutes
+        self.loop.create_task(ticket_sort_loop())
+        self.loop.create_task(triage_loop())  # A/B/C payout ticket sorting every 30 min  # tickets oldest to newest, every 10 minutes
         self.loop.create_task(leaderboard_loop())  # weekly mod leaderboard post  # close tickets where the trader stopped replying to staff
         self.loop.create_task(ultra_voice.ensure())  # download Ultra's voice in the background
         # Public API for the website's live payout feed (needs Railway public networking)
@@ -2549,6 +2550,16 @@ class PayoutForm(discord.ui.Modal, title="Payout request"):
         await ch.send("\n".join(lines)[:2000], view=close_view(),
                       allowed_mentions=discord.AllowedMentions.none())
         await interaction.followup.send(f"Your payout ticket is open: {ch.mention}", ephemeral=True)
+        bot.loop.create_task(_triage_new(guild, ch))
+
+
+async def _triage_new(guild, ch):
+    await asyncio.sleep(3)
+    try:
+        await triage_pass(guild, only=[ch])
+        await sort_ticket_categories(guild)
+    except Exception:
+        log.exception("Sorting new ticket failed")
 
 
 class PayoutBugForm(discord.ui.Modal, title="Report a payout bug"):
@@ -2767,6 +2778,230 @@ def close_view() -> discord.ui.View:
     v = discord.ui.View(timeout=None)
     v.add_item(CloseTicketButton())
     return v
+
+
+# --------------------------------------------------------------------------- #
+# Auto-sort payout tickets into three neutral-looking categories. Traders only see
+# "Payout Support Verified A / B / C" (like overflow), never why.
+#   A = clean (Sam can pay)   B = check (Jack to look / interview)   C = flagged (hedging / rule broken)
+# Nothing is posted in the ticket. Staff moving a ticket by hand between A/B/C is remembered and never undone.
+# --------------------------------------------------------------------------- #
+
+TRIAGE_ON = os.getenv("TRIAGE_ON", "1") not in ("0", "false", "off", "")
+TRIAGE_NAMES = {"clean": os.getenv("TRIAGE_CLEAN_NAME", "Payout Support Verified A"),
+                "check": os.getenv("TRIAGE_CHECK_NAME", "Payout Support Verified B"),
+                "flagged": os.getenv("TRIAGE_FLAG_NAME", "Payout Support Verified C")}
+TRIAGE_FILE = os.path.join(DATA_DIR, "triage.json")
+_triage_lock = asyncio.Lock()
+
+
+def _triage_load() -> dict:
+    try:
+        with open(TRIAGE_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _triage_save(d: dict):
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        with open(TRIAGE_FILE, "w", encoding="utf-8") as f:
+            json.dump(d, f)
+    except Exception:
+        log.exception("Couldn't save triage")
+
+
+_triage = _triage_load()            # {"tickets": {channel id: {"status", "manual", "why"}}}
+_triage_moving: set[int] = set()    # channels the bot itself is moving (so it isn't taken as a manual move)
+
+
+def _status_of_category(cat) -> str | None:
+    if cat is None:
+        return None
+    for st, nm in TRIAGE_NAMES.items():
+        if cat.name == nm or re.fullmatch(re.escape(nm) + r" \d+", cat.name):
+            return st
+    return None
+
+
+async def triage_category(guild: discord.Guild, status: str) -> discord.CategoryChannel | None:
+    """The category for a status, made (with the payout category's permissions) if it doesn't exist yet,
+    with its own overflow ('Payout Support Verified A 2', ...) when it has 50 channels."""
+    name = TRIAGE_NAMES[status]
+    async with _overflow_lock:
+        n = 1
+        while True:
+            nm = name if n == 1 else f"{name} {n}"
+            cat = discord.utils.get(guild.categories, name=nm)
+            if cat is None:
+                base = guild.get_channel(PAYOUT_TICKET_CATEGORY_ID)
+                over = base.overwrites if isinstance(base, discord.CategoryChannel) else {
+                    guild.default_role: discord.PermissionOverwrite(view_channel=False)}
+                pos = (base.position + 1) if isinstance(base, discord.CategoryChannel) else None
+                kw = {"position": pos} if pos is not None else {}
+                return await guild.create_category(nm, overwrites=over, reason="Payout ticket sorting", **kw)
+            if len(cat.channels) < 50:
+                return cat
+            n += 1
+
+
+async def ticket_facts(ch: discord.TextChannel) -> dict:
+    """Username, email, amount and wallet from the payout form message the bot posted in the ticket."""
+    f = {"uid": None, "username": "", "email": "", "amount": None, "wallet": ""}
+    m = re.search(r"uid:(\d+)", ch.topic or "")
+    if m:
+        f["uid"] = int(m.group(1))
+    try:
+        async for msg in ch.history(limit=15, oldest_first=True):
+            t = msg.content or ""
+            if "**User:**" not in t:
+                continue
+            u = re.search(r"\*\*User:\*\*\s*([^\n(]+)", t)
+            e = re.search(r"\*\*Email:\*\*\s*(\S+)", t)
+            a = re.search(r"\*\*Amount:\*\*\s*\$?\s*([0-9][0-9,.\s]*)", t)
+            w = re.search(r"`([^`]{20,})`", t)
+            f["username"] = (u.group(1).strip() if u else "").lstrip("@")
+            f["email"] = (e.group(1).strip().lower() if e else "")
+            if a:
+                raw = a.group(1).replace(" ", "")
+                raw = raw.replace(",", ".") if raw.count(",") == 1 and "." not in raw and len(raw.split(",")[1]) == 2 \
+                    else raw.replace(",", "")
+                try:
+                    f["amount"] = float(raw.rstrip("."))
+                except ValueError:
+                    pass
+            f["wallet"] = (w.group(1).strip().lower() if w else "")
+            break
+    except discord.HTTPException:
+        pass
+    return f
+
+
+def classify_ticket(f: dict, member, watch: dict, keys: dict, review: dict, wallet_owners: dict) -> tuple[str, str]:
+    """(status, reason). Exact matches only for 'flagged', so a similar name never lands someone in C."""
+    names = {x.lower() for x in (f["username"], getattr(member, "name", ""), getattr(member, "global_name", "") or "",
+                                  getattr(member, "display_name", "")) if x}
+    by_key = keys.get(f["email"]) if f["email"] else None
+    if by_key and by_key in watch:
+        return "flagged", f"email matches hedger {by_key} in the report"
+    for n in names:
+        if n in watch:
+            return "flagged", f"name matches hedger {n} in the report"
+    if by_key and by_key in review:
+        return "check", f"email matches {by_key} (shared-IP review list)"
+    for n in names:
+        if n in review:
+            return "check", f"name matches {n} (shared-IP review list)"
+    w = f["wallet"]
+    if w and len(wallet_owners.get(w, set())) > 1:
+        return "check", "wallet is also used in another trader's ticket"
+    if f["amount"] is not None and f["amount"] < 20:
+        return "check", f"amount ${f['amount']:.2f} is under the $20 minimum"
+    return "clean", "no flags"
+
+
+async def triage_pass(guild: discord.Guild, only: list | None = None) -> dict:
+    """Sort open payout tickets into A/B/C. Skips bug tickets, tickets in the hedge category, and any ticket a
+    staff member placed by hand. Returns counts of moves."""
+    if not TRIAGE_ON:
+        return {}
+    async with _triage_lock:
+        tickets = [c for c in guild.text_channels if our_ticket(c) and "Payout ticket" in (c.topic or "")]
+        watch, keys = load_hedge_watchlist()
+        review = load_hedge_review(watch)
+        facts = {}
+        for c in tickets:
+            facts[c.id] = await ticket_facts(c)
+            await asyncio.sleep(0.3)
+        wallet_owners: dict[str, set] = {}
+        for c in tickets:
+            fx = facts[c.id]
+            if fx["wallet"]:
+                wallet_owners.setdefault(fx["wallet"], set()).add(fx["uid"] or c.id)
+        store = _triage.setdefault("tickets", {})
+        moved = {"clean": 0, "check": 0, "flagged": 0}
+        for c in (only or tickets):
+            if c.id not in facts:
+                continue
+            rec = store.get(str(c.id), {})
+            if rec.get("manual") or c.category_id == HEDGE_CATEGORY_ID:
+                continue
+            member = None
+            if facts[c.id]["uid"]:
+                member = guild.get_member(facts[c.id]["uid"])
+                if member is None:
+                    try:
+                        member = await guild.fetch_member(facts[c.id]["uid"])
+                    except discord.HTTPException:
+                        member = None
+            status, why = classify_ticket(facts[c.id], member, watch, keys, review, wallet_owners)
+            store[str(c.id)] = {"status": status, "manual": False, "why": why, "user": facts[c.id]["username"]}
+            if _status_of_category(c.category) == status:
+                continue
+            try:
+                cat = await triage_category(guild, status)
+                _triage_moving.add(c.id)
+                await c.edit(category=cat, sync_permissions=False, reason="Payout ticket sorting")
+                moved[status] += 1
+            except discord.HTTPException:
+                log.warning("Couldn't move #%s to %s", c.name, status, exc_info=True)
+            await asyncio.sleep(1)
+        live = {str(c.id) for c in guild.text_channels if our_ticket(c)}
+        _triage["tickets"] = {k: v for k, v in store.items() if k in live}
+        _triage_save(_triage)
+        return moved
+
+
+def triage_manual_move(before, after):
+    """A staff member dragged a ticket between A / B / C: remember it so the bot never moves it back."""
+    if after.id in _triage_moving:
+        _triage_moving.discard(after.id)
+        return
+    st = _status_of_category(after.category)
+    if not our_ticket(after) or st is None or _status_of_category(before.category) == st:
+        return
+    _triage.setdefault("tickets", {})[str(after.id)] = {"status": st, "manual": True, "why": "moved by staff"}
+    _triage_save(_triage)
+
+
+async def triage_loop():
+    await bot.wait_until_ready()
+    await asyncio.sleep(90)
+    while True:
+        for g in bot.guilds:
+            try:
+                moved = await triage_pass(g)
+                if any(moved.values()):
+                    await sort_ticket_categories(g)
+            except Exception:
+                log.exception("Ticket sorting failed")
+        await asyncio.sleep(30 * 60)
+
+
+@bot.tree.command(name="ticketsort", description="Staff: sort payout tickets into A (clean), B (check), C (flagged)")
+@app_commands.describe(show="Just list where each ticket is and why (moves nothing)")
+async def ticketsort(interaction: discord.Interaction, show: bool = False):
+    if not (interaction.user.guild_permissions.administrator or is_staff(interaction.user)):
+        await interaction.response.send_message("Staff only.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    if not show:
+        moved = await triage_pass(interaction.guild)
+        await sort_ticket_categories(interaction.guild)
+        head = (f"Sorted. Moved {moved.get('clean', 0)} to A (clean), {moved.get('check', 0)} to B (check), "
+                f"{moved.get('flagged', 0)} to C (flagged). Oldest at the top.\n")
+    else:
+        head = ""
+    rows = {"flagged": [], "check": []}
+    for cid, r in _triage.get("tickets", {}).items():
+        if r.get("status") in rows:
+            rows[r["status"]].append(f"<#{cid}> · {r.get('why', '')}" + (" *(placed by staff)*" if r.get("manual") else ""))
+    txt = head + "**C · flagged**\n" + ("\n".join(rows["flagged"]) or "none") + \
+        "\n\n**B · check**\n" + ("\n".join(rows["check"]) or "none") + \
+        "\n\n-# Everything else is in A (clean). Staff can drag a ticket between A/B/C and the bot will leave it there."
+    for i in range(0, len(txt), 1900):
+        await interaction.followup.send(txt[i:i + 1900], ephemeral=True)
 
 
 # ---- keep tickets in order: oldest at the top of each ticket category, newest at the bottom
@@ -4634,6 +4869,7 @@ async def on_guild_channel_delete(channel):
 async def on_guild_channel_update(before, after):
     if before.category_id != after.category_id:
         bot.loop.create_task(_fud_refresh(after.guild))
+        triage_manual_move(before, after)
 
 
 TAG_BYPASS_WINDOW = 30          # another tag within 30 seconds of the last one counts as spam-tagging
