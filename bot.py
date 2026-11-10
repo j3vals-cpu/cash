@@ -4618,7 +4618,7 @@ _fud_strikes: dict[int, list[float]] = {}
 
 async def fud_strike(guild: discord.Guild, user_id: int, channel):
     """Payout complaint blocked again and again (rewording it to get past the filter):
-    2nd block in 30 min = warning, 3rd = 1 hour timeout."""
+    2nd block in 30 min = warning, 3rd = muted in general for 1 hour (like /jail: tickets still work)."""
     now = time.time()
     hits = [t for t in _fud_strikes.get(user_id, []) if now - t < FUD_STRIKE_WINDOW] + [now]
     _fud_strikes[user_id] = hits
@@ -4634,7 +4634,7 @@ async def fud_strike(guild: discord.Guild, user_id: int, channel):
     where = f"<#{tickets}>" if tickets else "a payout ticket"
     if len(hits) == 2:
         text = (f"{member.mention} payout questions go in {where}, not general. Rewording it to get past the "
-                f"filter won't work. **Next time you'll be timed out for 1 hour.**")
+                f"filter won't work. **Next time you'll be muted in general for 1 hour.**")
         if channel is not None:
             try:
                 await channel.send(text, delete_after=20, allowed_mentions=discord.AllowedMentions(users=[member]))
@@ -4642,32 +4642,41 @@ async def fud_strike(guild: discord.Guild, user_id: int, channel):
                 pass
         try:
             await member.send(f"Warning from **{guild.name}**: payout questions go in a payout ticket, not general. "
-                              f"If you try again you'll be timed out for 1 hour.")
+                              f"If you try again you'll be muted in general for 1 hour (tickets will still work).")
         except discord.HTTPException:
             pass
         await fud_log(guild, member, channel, "", "Warned: kept trying to post payout complaints in general", 0xF59E0B)
         return
+    secs = int(FUD_TIMEOUT.total_seconds())
     try:
-        await member.timeout(FUD_TIMEOUT, reason="Kept trying to get payout complaints past the general filter")
+        role = await _jail_role(guild)
+        await member.add_roles(role, reason="Muted in general 1 hour: kept trying to get payout complaints past the filter")
+        for ch in _jail_channels(guild):
+            await ch.set_permissions(member, send_messages=False, send_messages_in_threads=False,
+                                     add_reactions=False, reason="Muted in general")
     except discord.HTTPException:
-        await fud_log(guild, member, channel, "", "Couldn't time out (bot needs Timeout Members and a higher role)",
+        await fud_log(guild, member, channel, "", "Couldn't mute in general (bot needs Manage Roles + Manage Channels)",
                       0x6B7280)
         return
+    cfg = fud_store.get(guild.id)
+    cfg.setdefault("jailed", {})[str(member.id)] = time.time() + secs
+    fud_store.save()
+    mod_stats.event(guild.me, "mute")
     _fud_strikes.pop(user_id, None)
     if channel is not None:
         try:
-            await channel.send(f"{member.mention} has been timed out for 1 hour for repeatedly posting payout "
-                               f"complaints in general. Please use {where}.", delete_after=30,
+            await channel.send(f"{member.mention} has been muted in general for 1 hour for repeatedly posting payout "
+                               f"complaints here. They can still use {where}.", delete_after=30,
                                allowed_mentions=discord.AllowedMentions.none())
         except discord.HTTPException:
             pass
     try:
-        await member.send(f"You've been timed out for 1 hour in **{guild.name}** for repeatedly posting payout "
-                          f"complaints in general. Please use a payout ticket for payout questions.")
+        await member.send(f"You've been muted in general on **{guild.name}** for 1 hour for repeatedly posting payout "
+                          f"complaints there. You can still open and use tickets if you need help with your payout.")
     except discord.HTTPException:
         pass
-    await fud_log(guild, member, channel, "", "Timed out 1 hour: kept trying to get payout complaints past the filter",
-                  0xDC2626)
+    await fud_log(guild, member, channel, "", "Muted in general 1 hour: kept trying to get payout complaints past the "
+                  "filter (tickets still work)", 0x7C3AED)
 
 
 async def fud_log_self_delete(payload):
