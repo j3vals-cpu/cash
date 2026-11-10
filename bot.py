@@ -4607,6 +4607,67 @@ async def on_automod_action(execution: discord.AutoModAction):
     user = execution.member or guild.get_member(execution.user_id) or execution.user_id
     channel = guild.get_channel(execution.channel_id) if execution.channel_id else None
     await fud_log(guild, user, channel, execution.content, reason, colour)
+    if name == general_filter.RULE_NAME:
+        await fud_strike(guild, execution.user_id, channel)
+
+
+FUD_STRIKE_WINDOW = 30 * 60          # blocks within 30 minutes count as trying to get round the filter
+FUD_TIMEOUT = timedelta(hours=1)
+_fud_strikes: dict[int, list[float]] = {}
+
+
+async def fud_strike(guild: discord.Guild, user_id: int, channel):
+    """Payout complaint blocked again and again (rewording it to get past the filter):
+    2nd block in 30 min = warning, 3rd = 1 hour timeout."""
+    now = time.time()
+    hits = [t for t in _fud_strikes.get(user_id, []) if now - t < FUD_STRIKE_WINDOW] + [now]
+    _fud_strikes[user_id] = hits
+    if len(hits) < 2:
+        return
+    try:
+        member = guild.get_member(user_id) or await guild.fetch_member(user_id)
+    except discord.HTTPException:
+        return
+    if is_staff(member) or member.bot:
+        return
+    tickets = fud_store.get(guild.id).get("ticket_channel")
+    where = f"<#{tickets}>" if tickets else "a payout ticket"
+    if len(hits) == 2:
+        text = (f"{member.mention} payout questions go in {where}, not general. Rewording it to get past the "
+                f"filter won't work. **Next time you'll be timed out for 1 hour.**")
+        if channel is not None:
+            try:
+                await channel.send(text, delete_after=20, allowed_mentions=discord.AllowedMentions(users=[member]))
+            except discord.HTTPException:
+                pass
+        try:
+            await member.send(f"Warning from **{guild.name}**: payout questions go in a payout ticket, not general. "
+                              f"If you try again you'll be timed out for 1 hour.")
+        except discord.HTTPException:
+            pass
+        await fud_log(guild, member, channel, "", "Warned: kept trying to post payout complaints in general", 0xF59E0B)
+        return
+    try:
+        await member.timeout(FUD_TIMEOUT, reason="Kept trying to get payout complaints past the general filter")
+    except discord.HTTPException:
+        await fud_log(guild, member, channel, "", "Couldn't time out (bot needs Timeout Members and a higher role)",
+                      0x6B7280)
+        return
+    _fud_strikes.pop(user_id, None)
+    if channel is not None:
+        try:
+            await channel.send(f"{member.mention} has been timed out for 1 hour for repeatedly posting payout "
+                               f"complaints in general. Please use {where}.", delete_after=30,
+                               allowed_mentions=discord.AllowedMentions.none())
+        except discord.HTTPException:
+            pass
+    try:
+        await member.send(f"You've been timed out for 1 hour in **{guild.name}** for repeatedly posting payout "
+                          f"complaints in general. Please use a payout ticket for payout questions.")
+    except discord.HTTPException:
+        pass
+    await fud_log(guild, member, channel, "", "Timed out 1 hour: kept trying to get payout complaints past the filter",
+                  0xDC2626)
 
 
 async def fud_log_self_delete(payload):
