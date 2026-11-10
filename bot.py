@@ -2846,10 +2846,31 @@ def _status_of_category(cat) -> str | None:
     return None
 
 
+def triage_adopt(guild: discord.Guild) -> bool:
+    """Pick up every category named 'Payout Support Verified 1/2/3' (or '... 1 2' etc) that the bot lost track of,
+    e.g. after a restart, so duplicates get merged and grouped instead of sitting around the server."""
+    cats = _triage.setdefault("cats", {})
+    known = {i for ids in cats.values() for i in ids}
+    changed = False
+    for cat in sorted(guild.categories, key=lambda c: c.position):
+        if cat.id in known:
+            continue
+        for st, nm in TRIAGE_NAMES.items():
+            if re.fullmatch(re.escape(nm) + r"( \d+)?", cat.name):
+                cats.setdefault(st, []).append(cat.id)
+                known.add(cat.id)
+                changed = True
+                break
+    if changed:
+        _triage_save(_triage)
+    return changed
+
+
 async def triage_category(guild: discord.Guild, status: str) -> discord.CategoryChannel | None:
     """The category for a status, made (with the payout category's permissions) if it doesn't exist yet,
     with its own overflow ('Payout Support Verified 1 2', ...) when it has 50 channels."""
     name = TRIAGE_NAMES[status]
+    triage_adopt(guild)
     async with _overflow_lock:
         ids = _triage.setdefault("cats", {}).setdefault(status, [])
         live = [guild.get_channel(i) for i in ids]
@@ -3083,30 +3104,38 @@ async def clean_empty_categories(guild: discord.Guild) -> list[str]:
             keep.add(ids[0])
     bases = [guild.get_channel(i) for i in (PAYOUT_TICKET_CATEGORY_ID, PAYOUT_BUG_CATEGORY_ID)]
     bases = [b for b in bases if isinstance(b, discord.CategoryChannel)]
-    # a status with two categories (e.g. two "Payout Support Verified 2"): keep a non-empty one as the main one
+    triage_adopt(guild)
+    # a status with several categories (e.g. two "Payout Support Verified 2"): the fullest one is the main one
     for ids in _triage.get("cats", {}).values():
         cs = [guild.get_channel(i) for i in ids]
         cs = [c for c in cs if isinstance(c, discord.CategoryChannel)]
-        cs.sort(key=lambda c: (len(c.channels) == 0, c.position))
+        cs.sort(key=lambda c: (-len(c.channels), c.position))
         ids[:] = [c.id for c in cs]
-    # merge: if a status has two categories and they fit in one (50 max), move the tickets into the main one
+    # merge: fill the first category of each status up to 50, then the next, so there are no half-empty
+    # duplicates. Tickets keep their own permissions (sync_permissions=False).
     for st, ids in _triage.get("cats", {}).items():
         cs = [guild.get_channel(i) for i in ids]
         cs = [c for c in cs if isinstance(c, discord.CategoryChannel)]
         if len(cs) < 2:
             continue
-        main = cs[0]
-        for extra in cs[1:]:
-            for ch in list(extra.channels):
-                if len(main.channels) >= 50:
-                    break
-                try:
-                    if our_ticket(ch):
-                        _triage_moving.add(ch.id)
-                    await ch.edit(category=main, sync_permissions=False, reason="Merging duplicate ticket category")
-                except discord.HTTPException:
-                    log.warning("Couldn't merge #%s", ch.name, exc_info=True)
-                await asyncio.sleep(1)
+        moved: set[int] = set()
+        for ti, target in enumerate(cs[:-1]):
+            room = 50 - len(target.channels)
+            for src in reversed(cs[ti + 1:]):
+                for ch in sorted(src.channels, key=lambda c: c.position):
+                    if room <= 0:
+                        break
+                    if ch.id in moved:
+                        continue
+                    try:
+                        if our_ticket(ch):
+                            _triage_moving.add(ch.id)
+                        await ch.edit(category=target, sync_permissions=False, reason="Grouping ticket categories")
+                        moved.add(ch.id)
+                        room -= 1
+                    except discord.HTTPException:
+                        log.warning("Couldn't merge #%s", ch.name, exc_info=True)
+                    await asyncio.sleep(1)
     keep = {PAYOUT_TICKET_CATEGORY_ID, PAYOUT_BUG_CATEGORY_ID, HEDGE_CATEGORY_ID} | \
         {ids[0] for ids in _triage.get("cats", {}).values() if ids}
     triage_extra = {i for ids in _triage.get("cats", {}).values() for i in ids[1:]}
@@ -3132,22 +3161,28 @@ async def clean_empty_categories(guild: discord.Guild) -> list[str]:
 
 
 async def order_triage_categories(guild: discord.Guild):
-    """Keep the categories in order 1, 2, 3 (each followed by its overflow), using the slots they already have."""
-    order = []
+    """Keep the ticket categories together in one block: every 1 (with its overflow), then every 2, then every 3,
+    sitting where the first of them is now. Other categories keep their order. Permissions are untouched."""
+    block = []
     for st in ("clean", "check", "flagged"):
         for i in _triage.get("cats", {}).get(st, []):
             c = guild.get_channel(i)
-            if isinstance(c, discord.CategoryChannel):
-                order.append(c)
-    if len(order) < 2:
+            if isinstance(c, discord.CategoryChannel) and c not in block:
+                block.append(c)
+    if len(block) < 2:
         return
-    current = sorted(order, key=lambda c: c.position)
-    if [c.id for c in current] == [c.id for c in order]:
+    allcats = sorted(guild.categories, key=lambda c: (c.position, c.id))
+    ids = {c.id for c in block}
+    at = next(n for n, c in enumerate(allcats) if c.id in ids)
+    rest = [c for c in allcats if c.id not in ids]
+    at = sum(1 for c in allcats[:at] if c.id not in ids)
+    want = rest[:at] + block + rest[at:]
+    if [c.id for c in want] == [c.id for c in allcats] and \
+            [c.position for c in allcats] == list(range(len(allcats))):
         return
-    slots = [c.position for c in current]
     try:
-        await bot.http.bulk_channel_update(guild.id, [{"id": c.id, "position": p} for c, p in zip(order, slots)],
-                                           reason="Ticket categories in order 1, 2, 3")
+        await bot.http.bulk_channel_update(guild.id, [{"id": c.id, "position": n} for n, c in enumerate(want)],
+                                           reason="Ticket categories grouped 1, 2, 3")
     except discord.HTTPException:
         log.warning("Couldn't order ticket categories", exc_info=True)
 
@@ -3159,8 +3194,9 @@ async def cleancategories(interaction: discord.Interaction):
         return
     await interaction.response.defer(ephemeral=True, thinking=True)
     gone = await clean_empty_categories(interaction.guild)
-    await interaction.followup.send(("Deleted " + ", ".join(f"**{g}**" for g in gone)) if gone
-                                    else "No empty overflow categories to delete.", ephemeral=True)
+    await interaction.followup.send("Ticket categories grouped 1, 2, 3." +
+                                    (" Deleted " + ", ".join(f"**{g}**" for g in gone) if gone else ""),
+                                    ephemeral=True)
 
 
 async def ticket_sort_loop():
