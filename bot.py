@@ -298,7 +298,8 @@ class TicketBot(discord.Client):
         # Command syncing runs in the background so a Discord rate limit can never stop the website/office screen
         # from starting; it's skipped when the commands haven't changed since the last deploy.
         self.loop.create_task(self.sync_commands(og if OFFICE_GUILD_ID else None))
-        self.add_dynamic_items(CheckPaymentButton, OpenTicketButton, PayoutBugButton, VerifyButton, CloseTicketButton)  # 'Check payment' buttons keep working after restarts
+        self.add_dynamic_items(CheckPaymentButton, OpenTicketButton, PayoutBugButton, VerifyButton, CloseTicketButton,
+                               ApplyButton)  # 'Check payment' buttons keep working after restarts
         # Live payout feed runs in the background alongside the commands
         self.payout_feed = PayoutFeed(self)
         self.loop.create_task(self.payout_feed.run())
@@ -2399,13 +2400,16 @@ PAYOUT_BUG_CATEGORY_ID = int(os.getenv("PAYOUT_BUG_CATEGORY_ID", "15671637927592
 
 def open_ticket_of(guild, user_id, kind: str = "Payout ticket"):
     return next((c for c in guild.text_channels if our_ticket(c) and f"uid:{user_id}" in (c.topic or "")
-                 and (f"· {kind} ·" in (c.topic or "") or (kind == "Payout ticket" and "· Payout bug ·" not in (c.topic or "")))),
+                 and (f"· {kind} ·" in (c.topic or "") or (kind == "Payout ticket" and "· Payout bug ·" not in (c.topic or "")
+                                                            and "· Application ·" not in (c.topic or "")))),
                 None)
 
 
 def any_open_ticket(guild, user_id):
-    """Any ticket this person already has open (payout or payout bug). One ticket per person at a time."""
-    return next((c for c in guild.text_channels if our_ticket(c) and f"uid:{user_id}" in (c.topic or "")), None)
+    """Any payout / payout bug ticket this person already has open. One ticket per person at a time.
+    Job applications don't count, so a trader can apply while they have a payout ticket open."""
+    return next((c for c in guild.text_channels if our_ticket(c) and f"uid:{user_id}" in (c.topic or "")
+                 and "· Application ·" not in (c.topic or "")), None)
 
 
 ONE_TICKET_MSG = "You already have an open ticket: {mention}\nYou can only have one ticket open at a time, so please use that one."
@@ -2686,6 +2690,112 @@ class OpenTicketButton(discord.ui.DynamicItem[discord.ui.Button], template=r"cas
             return
         await interaction.response.send_modal(PayoutForm(PAYOUT_TICKET_CATEGORY_ID or self.category_id,
                                                          info if info and info.get("linked") else None))
+
+
+# ---- hiring: "Join the team" on the panel opens a short application form and a private application ticket.
+# Applications go in their own category that only admins (and HIRING_ROLE_IDS, if set) can see, so expected pay
+# and personal details stay private. They don't count towards the one-ticket limit.
+
+APPLY_CATEGORY_ID = int(os.getenv("APPLY_CATEGORY_ID", "0") or 0)
+APPLY_CATEGORY_NAME = os.getenv("APPLY_CATEGORY_NAME", "Applications")
+HIRING_ROLE_IDS = {int(x) for x in os.getenv("HIRING_ROLE_IDS", "").split(",") if x.strip()}
+
+
+def open_application_of(guild, user_id):
+    return next((c for c in guild.text_channels if our_ticket(c) and f"uid:{user_id}" in (c.topic or "")
+                 and "· Application ·" in (c.topic or "")), None)
+
+
+async def application_category(guild: discord.Guild) -> discord.CategoryChannel:
+    cat = guild.get_channel(APPLY_CATEGORY_ID) if APPLY_CATEGORY_ID else None
+    if not isinstance(cat, discord.CategoryChannel):
+        cat = discord.utils.get(guild.categories, name=APPLY_CATEGORY_NAME)
+    if cat is None:
+        over = {guild.default_role: discord.PermissionOverwrite(view_channel=False),
+                guild.me: discord.PermissionOverwrite(view_channel=True, manage_channels=True)}
+        for rid in HIRING_ROLE_IDS:
+            r = guild.get_role(rid)
+            if r:
+                over[r] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
+        cat = await guild.create_category(APPLY_CATEGORY_NAME, overwrites=over, reason="Job applications")
+    return await ticket_category(guild, cat)
+
+
+class ApplyForm(discord.ui.Modal, title="Join the Cashed team"):
+    role = discord.ui.TextInput(label="Which role?", placeholder="Support or Risk Manager", max_length=60)
+    experience = discord.ui.TextInput(label="Your experience", style=discord.TextStyle.paragraph, max_length=1000,
+                                      placeholder="Past support / moderation / risk roles, prop firms, trading, "
+                                                  "communities you've helped run")
+    availability = discord.ui.TextInput(label="Timezone and hours you can work", max_length=150,
+                                        placeholder="e.g. GMT+1, weekdays 9am-5pm, some weekends")
+    expected = discord.ui.TextInput(label="What do you expect in return?", max_length=300,
+                                    placeholder="e.g. monthly pay in USD, per-hour, commission, account perks")
+    why = discord.ui.TextInput(label="Why you? Anything else we should know", style=discord.TextStyle.paragraph,
+                               max_length=1000, required=False)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        guild, user = interaction.guild, interaction.user
+        existing = open_application_of(guild, user.id)
+        if existing:
+            await interaction.followup.send(f"You already have an application open: {existing.mention}", ephemeral=True)
+            return
+        try:
+            cat = await application_category(guild)
+        except discord.HTTPException:
+            log.exception("Couldn't make the applications category")
+            await interaction.followup.send("Couldn't send your application. Please try again later.", ephemeral=True)
+            return
+        overwrites = dict(cat.overwrites)
+        overwrites[guild.default_role] = discord.PermissionOverwrite(view_channel=False)
+        overwrites[user] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True,
+                                                       attach_files=True, embed_links=True)
+        overwrites[guild.me] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True,
+                                                           manage_channels=True, embed_links=True, attach_files=True)
+        try:
+            ch = await guild.create_text_channel(f"apply-{slug(user.name) or user.id}", category=cat, overwrites=overwrites,
+                                                 topic=f"{TICKET_TOPIC_MARK} · Application · uid:{user.id}",
+                                                 reason=f"Job application from {user}")
+        except discord.HTTPException:
+            log.exception("Couldn't create application ticket")
+            await interaction.followup.send("Couldn't send your application. Please try again later.", ephemeral=True)
+            return
+        e = discord.Embed(title=f"Application · {clean(self.role.value, 60)}", colour=0x5865F2,
+                          timestamp=datetime.now(timezone.utc))
+        e.add_field(name="Applicant", value=f"{user.mention} ({user})", inline=True)
+        joined = getattr(user, "joined_at", None)
+        if joined:
+            e.add_field(name="In server since", value=f"<t:{int(joined.timestamp())}:D>", inline=True)
+        e.add_field(name="Experience", value=self.experience.value.strip()[:1024] or "-", inline=False)
+        e.add_field(name="Timezone / hours", value=clean(self.availability.value, 150) or "-", inline=False)
+        e.add_field(name="Expects in return", value=self.expected.value.strip()[:1024] or "-", inline=False)
+        if (self.why.value or "").strip():
+            e.add_field(name="Why them / other", value=self.why.value.strip()[:1024], inline=False)
+        await ch.send(f"{user.mention} thanks for applying. Our team will review your application and reply here. "
+                      f"Feel free to add a CV or anything else that helps.",
+                      allowed_mentions=discord.AllowedMentions(users=[user]))
+        await ch.send(embed=e, view=close_view(), allowed_mentions=discord.AllowedMentions.none())
+        await interaction.followup.send(f"Application sent: {ch.mention}", ephemeral=True)
+
+
+class ApplyButton(discord.ui.DynamicItem[discord.ui.Button], template=r"cashed:apply"):
+    def __init__(self):
+        super().__init__(discord.ui.Button(label="Join the team", style=discord.ButtonStyle.primary,
+                                           custom_id="cashed:apply"))
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls()
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.guild is None:
+            return
+        existing = open_application_of(interaction.guild, interaction.user.id)
+        if existing:
+            await interaction.response.send_message(f"You already have an application open: {existing.mention}",
+                                                    ephemeral=True)
+            return
+        await interaction.response.send_modal(ApplyForm())
 
 
 # ---- closing our own tickets (staff only): transcript -> log channel, then delete the channel
@@ -3987,7 +4097,9 @@ async def panel(interaction: discord.Interaction, category: discord.CategoryChan
             "• You can only have **one ticket open** at a time.\n"
             "• Tickets **close automatically after 48 hours** if we're waiting on your reply, to keep things "
             "tidy. You can always open a new one.\n\n"
-            "Only verified accounts can open payout tickets. Make sure your wallet address and network are correct."),
+            "Only verified accounts can open payout tickets. Make sure your wallet address and network are correct.\n\n"
+            "**We're hiring**\n"
+            "Want to help run Cashed? Press **Join the team** to apply for Support or Risk Manager."),
         colour=0x16A34A)
     v = discord.ui.View(timeout=None)
     cat_id = category.id if category else PAYOUT_TICKET_CATEGORY_ID
@@ -3996,6 +4108,7 @@ async def panel(interaction: discord.Interaction, category: discord.CategoryChan
         return
     v.add_item(OpenTicketButton(cat_id))
     v.add_item(PayoutBugButton(PAYOUT_BUG_CATEGORY_ID or cat_id))
+    v.add_item(ApplyButton())
     v.add_item(VerifyButton())
     v.add_item(discord.ui.Button(label="Link account", style=discord.ButtonStyle.link, url=CASHED_LINK_URL))
     await interaction.channel.send(embed=e, view=v)
