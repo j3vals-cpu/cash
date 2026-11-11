@@ -2726,8 +2726,8 @@ class ApplyForm(discord.ui.Modal, title="Join the Cashed team"):
     experience = discord.ui.TextInput(label="Your experience", style=discord.TextStyle.paragraph, max_length=1000,
                                       placeholder="Past support / moderation / risk roles, prop firms, trading, "
                                                   "communities you've helped run")
-    availability = discord.ui.TextInput(label="Timezone and hours you can work", max_length=150,
-                                        placeholder="e.g. GMT+1, weekdays 9am-5pm, some weekends")
+    availability = discord.ui.TextInput(label="Country, timezone and hours you can work", max_length=150,
+                                        placeholder="e.g. UK, GMT, weekdays 9am-5pm, some weekends")
     expected = discord.ui.TextInput(label="What do you expect in return?", max_length=300,
                                     placeholder="e.g. monthly pay in USD, per-hour, commission, account perks")
     why = discord.ui.TextInput(label="Why you? Anything else we should know", style=discord.TextStyle.paragraph,
@@ -2767,15 +2767,102 @@ class ApplyForm(discord.ui.Modal, title="Join the Cashed team"):
         if joined:
             e.add_field(name="In server since", value=f"<t:{int(joined.timestamp())}:D>", inline=True)
         e.add_field(name="Experience", value=self.experience.value.strip()[:1024] or "-", inline=False)
-        e.add_field(name="Timezone / hours", value=clean(self.availability.value, 150) or "-", inline=False)
+        e.add_field(name="Country / timezone / hours", value=clean(self.availability.value, 150) or "-", inline=False)
         e.add_field(name="Expects in return", value=self.expected.value.strip()[:1024] or "-", inline=False)
         if (self.why.value or "").strip():
             e.add_field(name="Why them / other", value=self.why.value.strip()[:1024], inline=False)
-        await ch.send(f"{user.mention} thanks for applying. Our team will review your application and reply here. "
-                      f"Feel free to add a CV or anything else that helps.",
+        e.add_field(name=APPLY_STATUS, value=APPLY_WAITING, inline=False)
+        await ch.send(f"{user.mention} thanks for applying.\n\n**One more step:** please upload here\n"
+                      f"• your **CV**\n"
+                      f"• **examples of previous work** (screenshots, documents or links: past support tickets, "
+                      f"risk reports, communities you've run, references)\n\n"
+                      f"Your application is only reviewed once both are here. If they're not uploaded within "
+                      f"{APPLY_UPLOAD_HOURS:g} hours, this application closes and you can apply again.",
                       allowed_mentions=discord.AllowedMentions(users=[user]))
         await ch.send(embed=e, view=close_view(), allowed_mentions=discord.AllowedMentions.none())
         await interaction.followup.send(f"Application sent: {ch.mention}", ephemeral=True)
+
+
+APPLY_UPLOAD_HOURS = float(os.getenv("APPLY_UPLOAD_HOURS", "48"))
+APPLY_STATUS = "CV & previous work"
+APPLY_WAITING = "⏳ Waiting for CV and previous work"
+_URL_RE = re.compile(r"https?://\S+")
+
+
+async def _application_card(ch):
+    async for m in ch.history(limit=10, oldest_first=True):
+        if m.author.id == bot.user.id and m.embeds and (m.embeds[0].title or "").startswith("Application"):
+            return m
+    return None
+
+
+async def application_upload_check(message: discord.Message):
+    """The applicant posted in their application: count files and links as their CV / previous work."""
+    ch = message.channel
+    topic = getattr(ch, "topic", None) or ""
+    if not our_ticket(ch) or "· Application ·" not in topic or f"uid:{message.author.id}" not in topic:
+        return
+    items = len(message.attachments) + len(_URL_RE.findall(message.content or ""))
+    if not items:
+        return
+    card = await _application_card(ch)
+    if card is None:
+        return
+    e = card.embeds[0]
+    idx = next((i for i, f in enumerate(e.fields) if f.name == APPLY_STATUS), None)
+    if idx is None:
+        return
+    m = re.search(r"(\d+) (?:file|upload)", e.fields[idx].value)
+    total = (int(m.group(1)) if m else 0) + items
+    done = total >= 2
+    e.set_field_at(idx, name=APPLY_STATUS, inline=False,
+                   value=(f"✅ {total} uploads received – ready to review" if done
+                          else f"📎 {total} upload received – waiting for the rest"))
+    try:
+        await card.edit(embed=e)
+        await message.add_reaction("✅")
+    except discord.HTTPException:
+        pass
+    if done and total - items < 2:
+        await ch.send("Thanks, we've got your CV and previous work. Your application is now with the team, "
+                      "and we'll reply here.")
+    elif not done:
+        await ch.send("Got it. If that was your CV, please also add your previous work (or the other way round).")
+
+
+async def application_upload_expired(ch, now) -> bool:
+    """Close an application whose CV / previous work never arrived. Returns True if this was an application."""
+    if "· Application ·" not in (ch.topic or ""):
+        return False
+    if (now - ch.created_at).total_seconds() / 3600 < APPLY_UPLOAD_HOURS:
+        return True
+    card = await _application_card(ch)
+    if card is None:
+        return True
+    f = next((f for f in card.embeds[0].fields if f.name == APPLY_STATUS), None)
+    if f is None or f.value.startswith("✅"):
+        return True
+    why = f"Auto-closed: CV and previous work not uploaded within {APPLY_UPLOAD_HOURS:g} hours."
+    try:
+        if not await save_transcript(ch, ch.guild.me, why):
+            return True
+    except Exception:
+        log.exception("Application transcript failed for #%s", ch.name)
+        return True
+    _bot_closing.add(ch.id)
+    try:
+        await ch.delete(reason=why)
+    except discord.NotFound:
+        pass
+    uid = re.search(r"uid:(\d+)", ch.topic or "")
+    member = ch.guild.get_member(int(uid.group(1))) if uid else None
+    if member:
+        try:
+            await member.send(f"Your application in {ch.guild.name} was closed because your CV and previous work "
+                              f"weren't uploaded within {APPLY_UPLOAD_HOURS:g} hours. You're welcome to apply again.")
+        except discord.HTTPException:
+            pass
+    return True
 
 
 class ApplyButton(discord.ui.DynamicItem[discord.ui.Button], template=r"cashed:apply"):
@@ -3476,6 +3563,8 @@ async def idle_close_loop():
             waiting = []
             for ch in [c for c in g.text_channels if our_ticket(c)]:
                 try:
+                    if await application_upload_expired(ch, now):
+                        continue
                     r = await _idle_check(ch, now)
                     if r and r[0] == "waiting":
                         waiting.append((ch, r[1], r[2], r[3]))
@@ -4474,6 +4563,10 @@ async def on_message(message: discord.Message):
         ticket_replies.note(message)
     if message.author.bot:
         return
+    try:
+        await application_upload_check(message)
+    except Exception:
+        log.exception("Application upload check failed")
     if message.channel.id in CHAT_CHANNEL_IDS:
         cfg = _board_cfg()
         why = chat_skip_reason(message.author)
