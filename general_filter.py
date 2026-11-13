@@ -75,6 +75,7 @@ class FilterStore:
         g = self.guilds.setdefault(str(guild_id), {})
         g.setdefault("channels", [])
         g.setdefault("tag_channels", list(g["channels"]))  # older setups had both on together
+        g.setdefault("tag_all", True)  # one tag (person or role) per message everywhere, tickets included
         g.setdefault("ticket_channel", DEFAULT_TICKET_CHANNEL)
         return g
 
@@ -113,15 +114,15 @@ def _exempt_channels(guild: discord.Guild, watched: set[int], use_categories: bo
 
 
 TAG_RULE = "Cashed Bot: one tag per message"
-TAG_NOTICE = "You can only tag one person per message."
+TAG_NOTICE = "You can only tag one person or role per message."
 
 
-async def _upsert(guild, rules, name, trigger, message, roles, watched, rule=None) -> str | None:
+async def _upsert(guild, rules, name, trigger, message, roles, watched, rule=None, everywhere=False) -> str | None:
     rule = rule or next((r for r in rules if r.name == name), None)
     actions = [discord.AutoModRuleAction(custom_message=message[:150])]
     last = None
     for use_cats in (True, False):  # categories first; fall back to listing channels one by one
-        exempt = _exempt_channels(guild, watched, use_cats)
+        exempt = [] if everywhere else _exempt_channels(guild, watched, use_cats)
         if len(exempt) > 50:
             last = (f"This server has {len(exempt)} channels/categories outside the filtered ones, and Discord "
                     f"only allows 50 exemptions. Move loose channels into categories, then try again.")
@@ -151,6 +152,7 @@ async def apply_rule(bot: discord.Client, guild: discord.Guild, cfg: dict, staff
         return "The bot needs the **Manage Server** permission (Server Settings → Roles → bot role)."
     watched = {int(c) for c in cfg.get("channels", []) if guild.get_channel(int(c))}
     tagged = {int(c) for c in cfg.get("tag_channels", []) if guild.get_channel(int(c))}
+    tag_all = bool(cfg.get("tag_all"))
     try:
         roles = [r for r in (guild.get_role(i) for i in staff_role_ids) if r][:20]
         errs = []
@@ -170,10 +172,10 @@ async def apply_rule(bot: discord.Client, guild: discord.Guild, cfg: dict, staff
         # existing one (e.g. its built-in "Block Mention Spam") instead of making a second.
         mrule = next((r for r in rules if r.name == TAG_RULE), None) or next(
             (r for r in rules if r.trigger.type == discord.AutoModRuleTriggerType.mention_spam), None)
-        if tagged:
+        if tagged or tag_all:
             e2 = await _upsert(guild, rules, TAG_RULE,
                                discord.AutoModTrigger(type=discord.AutoModRuleTriggerType.mention_spam, mention_limit=1),
-                               TAG_NOTICE, roles, tagged, rule=mrule)
+                               TAG_NOTICE, roles, tagged, rule=mrule, everywhere=tag_all)
             if e2:
                 errs.append(e2)
         elif mrule is not None:

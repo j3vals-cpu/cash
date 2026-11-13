@@ -5144,13 +5144,24 @@ async def fud_off(interaction: discord.Interaction, channel: discord.TextChannel
 
 @fud_group.command(name="tags", description="One tag per message + no spam-tagging, in this channel (or the one you pick)")
 @app_commands.describe(state="Turn it on or off", channel="Channel (default: this one)")
-@app_commands.choices(state=[app_commands.Choice(name="On", value="on"), app_commands.Choice(name="Off", value="off")])
+@app_commands.choices(state=[app_commands.Choice(name="On", value="on"), app_commands.Choice(name="Off", value="off"),
+                             app_commands.Choice(name="Everywhere (all channels and tickets)", value="all"),
+                             app_commands.Choice(name="Everywhere off", value="alloff")])
 async def fud_tags(interaction: discord.Interaction, state: app_commands.Choice[str], channel: discord.TextChannel = None):
     if not await _tag_staff_ok(interaction):
         return
     channel = channel or interaction.channel
     await interaction.response.defer(ephemeral=True, thinking=True)
     cfg = fud_store.get(interaction.guild_id)
+    if state.value in ("all", "alloff"):
+        cfg["tag_all"] = state.value == "all"
+        fud_store.save()
+        err = await _fud_apply(interaction.guild)
+        await interaction.followup.send(err or (
+            "Tag limit is on **everywhere**, tickets included: one person or role per message, and tagging again "
+            "within 30 seconds gets a warning, then a 6 hour timeout. Staff aren't affected."
+            if cfg["tag_all"] else "Server-wide tag limit is off. Channels set with On still have it."), ephemeral=True)
+        return
     if state.value == "on" and channel.id not in cfg["tag_channels"]:
         cfg["tag_channels"].append(channel.id)
     elif state.value == "off" and channel.id in cfg["tag_channels"]:
@@ -5205,7 +5216,8 @@ async def fud_status(interaction: discord.Interaction):
     cfg = fud_store.get(interaction.guild_id)
     err = await _fud_apply(interaction.guild)  # also re-applies the rule
     chans = " ".join(f"<#{c}>" for c in cfg["channels"]) or "nowhere"
-    tchans = " ".join(f"<#{c}>" for c in cfg["tag_channels"]) or "nowhere"
+    tchans = "every channel, tickets included" if cfg.get("tag_all") else (
+        " ".join(f"<#{c}>" for c in cfg["tag_channels"]) or "nowhere")
     await interaction.followup.send(f"**Payout filter:** {chans}\n**Tag limit:** {tchans}\n**Message they see:** "
                                     f"{general_filter.notice_text(bot, cfg)}" + (f"\n\n{err}" if err else ""),
                                     ephemeral=True)
@@ -5220,6 +5232,8 @@ async def _fud_refresh(guild: discord.Guild):
     """New or moved channels must be exempted again so the filter stays limited to general."""
     cfg = fud_store.get(guild.id) if guild else {}
     if not guild or not (cfg["channels"] or cfg["tag_channels"]) or guild.id in _fud_pending:
+        return
+    if cfg.get("tag_all") and not cfg["channels"]:  # tag limit is server-wide: nothing to re-exempt
         return
     _fud_pending.add(guild.id)
     try:
@@ -5261,7 +5275,8 @@ async def tag_bypass_check(message: discord.Message):
     tag after tag within a few seconds to get round the limit: first time a warning, second time a 6 hour timeout."""
     if message.guild is None or message.author.bot or is_staff(message.author):
         return
-    if message.channel.id not in fud_store.get(message.guild.id)["tag_channels"]:
+    _tcfg = fud_store.get(message.guild.id)
+    if not _tcfg.get("tag_all") and message.channel.id not in _tcfg["tag_channels"]:
         return
     tags = {t for t in re.findall(r"<@[!&]?(\d+)>", message.content) if t != str(message.author.id)}
     if len(tags) != 1:
@@ -5447,7 +5462,7 @@ async def fud_rule_on_start():
             fud_store.save()
     for gid, cfg in list(fud_store.guilds.items()):
         g = bot.get_guild(int(gid))
-        if g and (cfg.get("channels") or cfg.get("tag_channels")):
+        if g and (cfg.get("channels") or cfg.get("tag_channels") or fud_store.get(int(gid)).get("tag_all")):
             err = await _fud_apply(g)
             if err:
                 log.warning("General filter not active in %s: %s", g.name, err)
