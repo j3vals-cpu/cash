@@ -32,8 +32,8 @@ PATTERNS = [
     r"(?i)\b" + _W + r"\b[ -~]{0,40}\bstill (?:" + _PEND + r"|" + _WAIT + r"|not|no|nothing|hasn'?t|haven'?t)\b",
     # "payout ... not paid / not received / never came"
     r"(?i)\b" + _W + r"\b[ -~]{0,40}\b(?:not (?:been )?(?:paid|received|sent|processed|arrived)|never (?:came|arrived|received|paid))\b",
-    # "when will my payout come", "where's payouts", "when do i get my money"
-    r"(?i)\b(?:when|where)'?s?(?: (?:is|are|r|will|do|am)(?: i| we)?(?: get| getting| receive)?)? +(?:(?:my|the|our) +(?:[a-z0-9]+ +)?)?" + _W + r"\b",
+    # "when will my payout come", "where's payouts", "wen i will get my pay0ut", "when do i get my money"
+    r"(?i)\b(?:wh?en|where)(?:'?s)?\b[ -~]{0,25}\b" + _W + r"\b",
     # "no response on my payout ticket", "payout where", "payout when??"
     r"(?i)\bno(?:body| (?:reply|response|answer|update|one))\b[ -~]{0,30}\b(?:" + _PAY + r"|ticket)\b|\bp[a@4]+y+[ -]?[o0]+u+[tr][sz]? +(?:where|wen|when)\b",
     # "waiting ... for my payout", "pending payout", "still waiting to get paid"
@@ -49,9 +49,14 @@ PATTERNS = [
 ]
 _COMPILED = [re.compile(p) for p in PATTERNS]
 
+# Code words people use for "payout" to get round the filter ("pornos", "porn-out"). Plain AutoMod keywords:
+# * matches any ending, so "porno*" also catches "pornos".
+KEYWORDS = ["porno*", "pornout*", "porn-out*", "porn out*", "p0rno*", "p0rn-out*", "p0rnout*"]
+_KW = re.compile(r"(?i)\bp[o0]rn(?:[o0]|[ -]?[o0]ut)")
+
 
 def would_block(text: str) -> bool:
-    return any(p.search(text or "") for p in _COMPILED)
+    return bool(_KW.search(text or "")) or any(p.search(text or "") for p in _COMPILED)
 
 
 class FilterStore:
@@ -153,7 +158,7 @@ async def apply_rule(bot: discord.Client, guild: discord.Guild, cfg: dict, staff
         if watched:
             e1 = await _upsert(guild, rules, RULE_NAME,
                                discord.AutoModTrigger(type=discord.AutoModRuleTriggerType.keyword,
-                                                      regex_patterns=PATTERNS),
+                                                      regex_patterns=PATTERNS, keyword_filter=KEYWORDS),
                                notice_text(bot, cfg), roles, watched)
             if e1:
                 errs.append(e1)
